@@ -16695,12 +16695,17 @@ string CompilerGLSL::to_array_size(const SPIRType &type, uint32_t index)
 	else if (!backend.unsized_array_supported)
 	{
 		// For runtime-sized arrays, we can work around
-		// lack of standard support for this by simply having
-		// a single element array.
+		// lack of standard support for this by emitting a
+		// fixed-size array with a backend-configurable fallback
+		// literal. Default "1" matches the historical GLSL/HLSL
+		// behaviour; MSL bumps this to "65536" because Apple GPUs
+		// silently drop `device T&` writes past index 0 when the
+		// declared size is 1 (even when the underlying MTLBuffer
+		// is sized to fit many elements).
 		//
 		// Runtime length arrays must always be the last element
 		// in an interface block.
-		return "1";
+		return backend.unsized_array_fallback_literal;
 	}
 	else
 		return "";

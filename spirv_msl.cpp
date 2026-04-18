@@ -1687,6 +1687,7 @@ string CompilerMSL::compile()
 	backend.use_typed_initializer_list = true;
 	backend.native_row_major_matrix = false;
 	backend.unsized_array_supported = false;
+	backend.unsized_array_fallback_literal = "65536";
 	backend.can_declare_arrays_inline = false;
 	backend.allow_truncated_access_chain = true;
 	backend.comparison_image_samples_scalar = true;

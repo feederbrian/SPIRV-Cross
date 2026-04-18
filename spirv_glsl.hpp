@@ -639,6 +639,14 @@ protected:
 		bool swizzle_is_function = false;
 		bool shared_is_implied = false;
 		bool unsized_array_supported = true;
+		// When unsized_array_supported is false, this is the fallback
+		// array size emitted for runtime-sized arrays. Default "1"
+		// matches GLSL/HLSL behaviour; MSL overrides to a large value
+		// (65536) so Apple GPUs don't silently drop writes past index 0
+		// under `device T&` reference semantics — the [1] bound causes
+		// implementation-defined behaviour even though the underlying
+		// MTLBuffer is sized to fit many elements. See CompilerMSL ctor.
+		const char *unsized_array_fallback_literal = "1";
 		bool explicit_struct_type = false;
 		bool use_initializer_list = false;
 		bool use_typed_initializer_list = false;
