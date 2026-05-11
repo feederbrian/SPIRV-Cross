@@ -9818,8 +9818,14 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	// Reads == Fetches in Metal
 	case OpImageRead:
 	{
-		// Mark that this shader reads from this image
+		uint32_t result_type = ops[0];
+		uint32_t id = ops[1];
 		uint32_t img_id = ops[2];
+		uint32_t coord_id = ops[3];
+		const uint32_t *opt = &ops[4];
+		uint32_t length = instruction.length - 4;
+
+		// Mark that this shader reads from this image
 		auto &type = expression_type(img_id);
 		auto *p_var = maybe_get_backing_variable(img_id);
 		if (type.image.dim != DimSubpassData)
@@ -9838,6 +9844,69 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			// Need to wrap this with a value type,
 			// since the Metal headers are broken and do not consider case when the image is a reference.
 			statement("spvImageFence(", to_expression(img_id), ");");
+		}
+
+		auto &img_type = get<SPIRType>(type.self);
+		const bool appgl_ms_storage_image_sidecar =
+		    get_execution_model() == ExecutionModelGLCompute &&
+		    type.basetype == SPIRType::Image &&
+		    img_type.image.sampled == 2 &&
+		    img_type.image.ms &&
+		    img_type.image.dim == Dim2D;
+		if (appgl_ms_storage_image_sidecar)
+		{
+			uint32_t sample = 0;
+			uint32_t flags = 0;
+			if (length)
+			{
+				flags = *opt++;
+				length--;
+			}
+			auto test = [&](uint32_t &v, uint32_t flag) {
+				if (length && (flags & flag))
+				{
+					v = *opt++;
+					length--;
+				}
+			};
+			uint32_t ignored = 0;
+			test(ignored, ImageOperandsBiasMask);
+			test(ignored, ImageOperandsLodMask);
+			test(ignored, ImageOperandsGradMask);
+			test(ignored, ImageOperandsGradMask);
+			test(ignored, ImageOperandsConstOffsetMask);
+			test(ignored, ImageOperandsOffsetMask);
+			test(ignored, ImageOperandsConstOffsetsMask);
+			test(sample, ImageOperandsSampleMask);
+			test(ignored, ImageOperandsMinLodMask);
+			if (sample == 0)
+				SPIRV_CROSS_THROW("MS storage-image sidecar read requires an explicit sample operand.");
+
+			auto &coord_type = expression_type(coord_id);
+			const bool coord_is_fp = type_is_floating_point(coord_type);
+			string coord = to_enclosed_unpacked_expression(coord_id);
+			if (coord_type.vecsize > 2)
+				coord = enclose_expression(coord) + ".xy";
+			string tex_coords = "uint2(" + round_fp_tex_coords(coord, coord_is_fp) + ")";
+			string sample_expr = "uint(" + to_unpacked_expression(sample) + ")";
+			string slice_expr = sample_expr;
+			if (img_type.image.arrayed)
+			{
+				uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
+				string layer = "uint(" +
+				    round_fp_tex_coords(to_extract_component_expression(coord_id, 2), coord_is_fp) +
+				    ")";
+				slice_expr = join("((", layer, " * appgl_ms_storage_image_samples[",
+				                  resource_index, "]) + ", sample_expr, ")");
+			}
+
+			string expr = join(to_expression(img_id), ".read(", tex_coords, ", ", slice_expr, ")");
+			emit_op(result_type, id, expr,
+			        should_forward(img_id) && should_forward(coord_id) && should_forward(sample));
+			inherit_expression_dependencies(id, img_id);
+			inherit_expression_dependencies(id, coord_id);
+			inherit_expression_dependencies(id, sample);
+			break;
 		}
 
 		emit_texture_op(instruction, false);
@@ -9942,9 +10011,54 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		string expr;
 		if (needs_frag_discard_checks())
 			expr = join("(", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ((void)0) : ");
-		expr += join(to_expression(img_id), ".write(",
-		             remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)), ", ",
-		             CompilerMSL::to_function_args(args, &forward), ")");
+		const bool appgl_ms_storage_image_sidecar =
+		    get_execution_model() == ExecutionModelGLCompute &&
+		    type.basetype == SPIRType::Image &&
+		    img_type.image.sampled == 2 &&
+		    img_type.image.ms &&
+		    img_type.image.dim == Dim2D;
+		if (appgl_ms_storage_image_sidecar)
+		{
+			uint32_t sample = 0;
+			uint32_t ignored = 0;
+			test(ignored, ImageOperandsGradMask);
+			test(ignored, ImageOperandsGradMask);
+			test(ignored, ImageOperandsConstOffsetMask);
+			test(ignored, ImageOperandsOffsetMask);
+			test(ignored, ImageOperandsConstOffsetsMask);
+			test(sample, ImageOperandsSampleMask);
+			test(ignored, ImageOperandsMinLodMask);
+			if (sample == 0)
+				SPIRV_CROSS_THROW("MS storage-image sidecar write requires an explicit sample operand.");
+
+			auto &coord_type = expression_type(coord_id);
+			const bool coord_is_fp = type_is_floating_point(coord_type);
+			string coord = to_enclosed_unpacked_expression(coord_id);
+			if (coord_type.vecsize > 2)
+				coord = enclose_expression(coord) + ".xy";
+			string tex_coords = "uint2(" + round_fp_tex_coords(coord, coord_is_fp) + ")";
+			string sample_expr = "uint(" + to_unpacked_expression(sample) + ")";
+			string slice_expr = sample_expr;
+			if (img_type.image.arrayed)
+			{
+				uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
+				string layer = "uint(" +
+				    round_fp_tex_coords(to_extract_component_expression(coord_id, 2), coord_is_fp) +
+				    ")";
+				slice_expr = join("((", layer, " * appgl_ms_storage_image_samples[",
+				                  resource_index, "]) + ", sample_expr, ")");
+			}
+			forward = should_forward(coord_id) && should_forward(sample);
+			expr += join(to_expression(img_id), ".write(",
+			             remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)), ", ",
+			             tex_coords, ", ", slice_expr, ")");
+		}
+		else
+		{
+			expr += join(to_expression(img_id), ".write(",
+			             remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)), ", ",
+			             CompilerMSL::to_function_args(args, &forward), ")");
+		}
 		if (needs_frag_discard_checks())
 			expr += ")";
 		statement(expr, ";");
@@ -17484,10 +17598,22 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 			{
 				if (!msl_options.supports_msl_version(2, 1))
 					SPIRV_CROSS_THROW("Multisampled array textures are supported from 2.1.");
-				img_type_name += "texture2d_ms_array";
+				if (get_execution_model() == ExecutionModelGLCompute &&
+				    type.basetype == SPIRType::Image &&
+				    img_type.sampled == 2)
+					img_type_name += "texture2d_array";
+				else
+					img_type_name += "texture2d_ms_array";
 			}
 			else if (img_type.ms)
-				img_type_name += "texture2d_ms";
+			{
+				if (get_execution_model() == ExecutionModelGLCompute &&
+				    type.basetype == SPIRType::Image &&
+				    img_type.sampled == 2)
+					img_type_name += "texture2d_array";
+				else
+					img_type_name += "texture2d_ms";
+			}
 			else if (img_type.arrayed || subpass_array)
 				img_type_name += "texture2d_array";
 			else
