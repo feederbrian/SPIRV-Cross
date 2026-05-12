@@ -13000,6 +13000,21 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		alt_coord_component = 2;
 		break;
 
+	case DimRect:
+		// Metal represents GL rectangle textures as texture2d, so fetch/read
+		// coordinates still need the unsigned pixel-coordinate form used by
+		// texture2d::read and texture2d::sparse_read.
+		if (coord_type.vecsize > 2)
+			tex_coords = enclose_expression(tex_coords) + ".xy";
+
+		if (args.base.is_fetch)
+			tex_coords = "uint2(" + round_fp_tex_coords(tex_coords, coord_is_fp) + ")";
+		else if (sampling_type_needs_f32_conversion(coord_type))
+			tex_coords = convert_to_f32(tex_coords, 2);
+
+		alt_coord_component = 2;
+		break;
+
 	case Dim3D:
 		if (coord_type.vecsize > 3)
 			tex_coords = enclose_expression(tex_coords) + ".xyz";
