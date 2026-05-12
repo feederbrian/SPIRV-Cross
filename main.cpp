@@ -665,6 +665,18 @@ struct CLIArguments
 	bool msl_raw_buffer_tese_input = false;
 	bool msl_multi_patch_workgroup = false;
 	bool msl_vertex_for_tessellation = false;
+	bool msl_appgl_fp64_emulation = false;
+	bool msl_tess_evaluation_as_compute = false;
+	uint32_t msl_tese_input_patch_vertices = 0;
+	bool msl_geometry_shader_as_mesh = false;
+	bool msl_force_compute_kernel_device_barrier_at_exit = false;
+	bool msl_force_compute_kernel_device_volatile_writes = false;
+	bool msl_force_compute_kernel_atomic_writes_on_spvOut = false;
+	bool msl_force_compute_kernel_entry_counter_probe = false;
+	bool msl_force_threads_per_grid_for_stage_input_size = false;
+	bool msl_use_full_precision_tess_level_buffer = false;
+	uint32_t msl_shader_tess_factor_buffer_full_index = 23;
+	bool msl_input_emission_in_call_order = false;
 	uint32_t msl_additional_fixed_sample_mask = 0xffffffff;
 	bool msl_arrayed_subpass_input = false;
 	uint32_t msl_r32ui_linear_texture_alignment = 4;
@@ -943,6 +955,30 @@ static void print_help_msl()
 	                "\t\tIn a future version of SPIRV-Cross, this will become the default.\n"
 	                "\t[--msl-vertex-for-tessellation]:\n\t\tWhen handling a vertex shader, marks it as one that will be used with a new-style tessellation control shader.\n"
 	                "\t\tThe vertex shader is output to MSL as a compute kernel which outputs vertices to the buffer in the order they are received, rather than in index order as with --msl-capture-output normally.\n"
+	                "\t[--msl-appgl-fp64-emulation]:\n\t\t[AppGL fork] Lower SPIR-V FP64 values to AppGL df64 uint2 transport helpers instead of emitting native MSL double types.\n"
+	                "\t[--msl-tess-evaluation-as-compute]:\n\t\t[AppGL fork] Emit the tessellation evaluation shader as a compute kernel that writes its output to a host-supplied capture buffer instead of as a `[[patch(...)]] vertex` function.\n"
+	                "\t\tEnables transform-feedback capture of TES output. Pair with --msl-tese-input-patch-vertices to set the per-patch input stride.\n"
+	                "\t[--msl-tese-input-patch-vertices <count>]:\n\t\t[AppGL fork] Override the per-patch input vertex count used when computing `gl_in = &spvIn[gl_PrimitiveID * count]` in TES-as-compute mode.\n"
+	                "\t\tDefault is the linked TCS's `layout(vertices = N) out;` value; setting this is required when SPIRV-Cross can't see the TCS.\n"
+	                "\t[--msl-geometry-shader-as-mesh]:\n\t\t[AppGL fork] Translate a geometry shader to a Metal `[[mesh]]` function instead of rejecting the source.\n"
+	                "\t\tDeclares `spvMesh_t` from the GS's input/output topology + `max_vertices`, captures `EmitVertex`/`EndPrimitive` into a function-local vertex/primitive buffer, and flushes via `spvMesh.set_vertex` / `set_primitive` / `set_primitive_count` at function exit.\n"
+	                "\t[--msl-force-compute-kernel-device-barrier-at-exit]:\n\t\t[AppGL fork] Emit `threadgroup_barrier(mem_flags::mem_device)` at the end of `--msl-vertex-for-tessellation` VS-compute kernels.\n"
+	                "\t\tWorks around an AIR-layer cross-encoder-family liveness gap where VS-compute writes to `device main0_out*` survive compute->compute consumers but vanish across compute->render (e.g. mesh-pipeline) consumers. Default off; tess->tess paths unchanged.\n"
+	                "\t\tNote: empirically tested INSUFFICIENT alone — pair with --msl-force-compute-kernel-device-volatile-writes to defeat AIR elimination.\n"
+	                "\t[--msl-force-compute-kernel-device-volatile-writes]:\n\t\t[AppGL fork] Emit `volatile device main0_out*` instead of `device main0_out*` on the spvOut buffer parameter for `--msl-capture-output` paths.\n"
+	                "\t\tApple's MSL spec contractually preserves writes through volatile-qualified pointers across optimizer passes; the load-bearing primitive against AIR cross-encoder-family elimination. Default off; tess->tess paths unchanged.\n"
+	                "\t\tNote: empirically tested INSUFFICIENT alone (Checkpoint 11pp readback) — pair with --msl-force-compute-kernel-atomic-writes-on-spvOut for the contractually non-eliminable mitigation.\n"
+	                "\t[--msl-force-compute-kernel-atomic-writes-on-spvOut]:\n\t\t[AppGL fork] At kernel exit, emit per-scalar `atomic_store_explicit` re-stores of every spvOut field with `as_type<uint>` reinterpret + `memory_order_relaxed`.\n"
+	                "\t\tAtomic stores contractually cannot be eliminated by Apple's AIR optimizer — strongest mitigation in the Path E ladder. Default off; tess->tess paths unchanged.\n"
+	                "\t[--msl-force-compute-kernel-entry-counter-probe]:\n\t\t[AppGL fork diagnostic] Add `device atomic_uint* spvKernelEntryCounter [[buffer(27)]]` parameter and `atomic_fetch_add_explicit` increment at kernel preamble.\n"
+	                "\t\tDefinitively answers `did the kernel body execute` when downstream readback fails on the main spvOut buffer. Orthogonal to atomic_writes — can be enabled standalone.\n"
+	                "\t[--msl-force-threads-per-grid-for-stage-input-size]:\n\t\t[AppGL fork] Emit `[[threads_per_grid]]` instead of `[[grid_size]]` on the synthesized `spvStageInputSize` parameter for VS-compute kernels.\n"
+	                "\t\tFix for Apple Silicon `[[grid_size]]` returning (0,0,0) under dispatchThreads: / dispatchThreadgroups:, which causes every thread's bounds-check early-return to fire universally. Default off; tess->tess paths unchanged.\n"
+	                "\t[--msl-use-full-precision-tess-level-buffer]:\n\t\t[AppGL fork] TES-as-compute reads gl_TessLevelOuter / gl_TessLevelInner from a full-precision `device const float*` shadow buffer instead of Metal's half-precision MTLQuadTessellationFactorsHalf API.\n"
+	                "\t\tPer GL 4.6 §11.2.2, tess level values are float; Metal's half-precision API truncates information at write time. Layout: outer levels first, then inner levels, per primitive (stride = 4 for triangles, 6 for quads, 2 for isolines). Default off.\n"
+	                "\t[--msl-tess-factor-buffer-full-index <index>]:\n\t\t[AppGL fork] Buffer slot for the full-precision tess factor shadow buffer. Default 23 (dynamic_offsets_buffer_index, unused at TES-compute dispatch).\n"
+	                "\t[--msl-input-emission-in-call-order]:\n\t\t[AppGL fork] Order `main0_in` struct members by the orchestrator's `add_msl_shader_input` call sequence rather than by Location ascending.\n"
+	                "\t\tFor cross-stage byte alignment between TCS-out and TES-in when their natural IR-walk orders disagree (Path J' Option E.4 — gate 21). Default off; non-AppGL consumers retain `LocationThenBuiltInType` emission.\n"
 	                "\t[--msl-additional-fixed-sample-mask <mask>]:\n"
 	                "\t\tSet an additional fixed sample mask. If the shader outputs a sample mask, then the final sample mask will be a bitwise AND of the two.\n"
 	                "\t[--msl-arrayed-subpass-input]:\n\t\tAssume that images of dimension SubpassData have multiple layers. Layered input attachments are accessed relative to BuiltInLayer.\n"
@@ -1283,6 +1319,26 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.raw_buffer_tese_input = args.msl_raw_buffer_tese_input;
 		msl_opts.multi_patch_workgroup = args.msl_multi_patch_workgroup;
 		msl_opts.vertex_for_tessellation = args.msl_vertex_for_tessellation;
+		msl_opts.appgl_fp64_emulation = args.msl_appgl_fp64_emulation;
+		msl_opts.tess_evaluation_as_compute = args.msl_tess_evaluation_as_compute;
+		msl_opts.tese_input_patch_vertices = args.msl_tese_input_patch_vertices;
+		msl_opts.geometry_shader_as_mesh = args.msl_geometry_shader_as_mesh;
+		msl_opts.force_compute_kernel_device_barrier_at_exit =
+		    args.msl_force_compute_kernel_device_barrier_at_exit;
+		msl_opts.force_compute_kernel_device_volatile_writes =
+		    args.msl_force_compute_kernel_device_volatile_writes;
+		msl_opts.force_compute_kernel_atomic_writes_on_spvOut =
+		    args.msl_force_compute_kernel_atomic_writes_on_spvOut;
+		msl_opts.force_compute_kernel_entry_counter_probe =
+		    args.msl_force_compute_kernel_entry_counter_probe;
+		msl_opts.force_threads_per_grid_for_stage_input_size =
+		    args.msl_force_threads_per_grid_for_stage_input_size;
+		msl_opts.use_full_precision_tess_level_buffer =
+		    args.msl_use_full_precision_tess_level_buffer;
+		msl_opts.shader_tess_factor_buffer_full_index =
+		    args.msl_shader_tess_factor_buffer_full_index;
+		msl_opts.input_emission_in_call_order =
+		    args.msl_input_emission_in_call_order;
 		msl_opts.additional_fixed_sample_mask = args.msl_additional_fixed_sample_mask;
 		msl_opts.arrayed_subpass_input = args.msl_arrayed_subpass_input;
 		msl_opts.r32ui_linear_texture_alignment = args.msl_r32ui_linear_texture_alignment;
@@ -1872,6 +1928,29 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--msl-raw-buffer-tese-input", [&args](CLIParser &) { args.msl_raw_buffer_tese_input = true; });
 	cbs.add("--msl-multi-patch-workgroup", [&args](CLIParser &) { args.msl_multi_patch_workgroup = true; });
 	cbs.add("--msl-vertex-for-tessellation", [&args](CLIParser &) { args.msl_vertex_for_tessellation = true; });
+	cbs.add("--msl-appgl-fp64-emulation", [&args](CLIParser &) { args.msl_appgl_fp64_emulation = true; });
+	cbs.add("--msl-tess-evaluation-as-compute",
+	        [&args](CLIParser &) { args.msl_tess_evaluation_as_compute = true; });
+	cbs.add("--msl-tese-input-patch-vertices",
+	        [&args](CLIParser &parser) { args.msl_tese_input_patch_vertices = parser.next_uint(); });
+	cbs.add("--msl-geometry-shader-as-mesh",
+	        [&args](CLIParser &) { args.msl_geometry_shader_as_mesh = true; });
+	cbs.add("--msl-force-compute-kernel-device-barrier-at-exit",
+	        [&args](CLIParser &) { args.msl_force_compute_kernel_device_barrier_at_exit = true; });
+	cbs.add("--msl-force-compute-kernel-device-volatile-writes",
+	        [&args](CLIParser &) { args.msl_force_compute_kernel_device_volatile_writes = true; });
+	cbs.add("--msl-force-compute-kernel-atomic-writes-on-spvOut",
+	        [&args](CLIParser &) { args.msl_force_compute_kernel_atomic_writes_on_spvOut = true; });
+	cbs.add("--msl-force-compute-kernel-entry-counter-probe",
+	        [&args](CLIParser &) { args.msl_force_compute_kernel_entry_counter_probe = true; });
+	cbs.add("--msl-force-threads-per-grid-for-stage-input-size",
+	        [&args](CLIParser &) { args.msl_force_threads_per_grid_for_stage_input_size = true; });
+	cbs.add("--msl-use-full-precision-tess-level-buffer",
+	        [&args](CLIParser &) { args.msl_use_full_precision_tess_level_buffer = true; });
+	cbs.add("--msl-tess-factor-buffer-full-index",
+	        [&args](CLIParser &parser) { args.msl_shader_tess_factor_buffer_full_index = parser.next_uint(); });
+	cbs.add("--msl-input-emission-in-call-order",
+	        [&args](CLIParser &) { args.msl_input_emission_in_call_order = true; });
 	cbs.add("--msl-additional-fixed-sample-mask",
 	        [&args](CLIParser &parser) { args.msl_additional_fixed_sample_mask = parser.next_hex_uint(); });
 	cbs.add("--msl-arrayed-subpass-input", [&args](CLIParser &) { args.msl_arrayed_subpass_input = true; });

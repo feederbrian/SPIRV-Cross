@@ -26,6 +26,8 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <cmath>
+#include <limits>
 #include <numeric>
 
 using namespace SPIRV_CROSS_SPV_HEADER_NAMESPACE;
@@ -58,7 +60,81 @@ CompilerMSL::CompilerMSL(ParsedIR &&ir_)
 
 void CompilerMSL::add_msl_shader_input(const MSLShaderInterfaceVariable &si)
 {
-	inputs_by_location[{si.location, si.component}] = si;
+	// Path J' Option A1 (Sprint 5 Phase 1 — Class 2 spec-compliance):
+	// dedupe by name when the entry's location is in the synthetic-key
+	// range (0xE0000000+). AppGL fork orchestrator uses synthetic-range
+	// locations to disambiguate type collisions on natural location
+	// (e.g., multiple TES inputs all naturally at location 0 component 0
+	// because the linked TCS auto-allocates them). When the orchestrator
+	// passes the same name with BOTH a natural location AND a synthetic-
+	// range location to drive cross-stage matching, the unguarded keying
+	// on `{location, component}` would create two map entries with the
+	// same name — main0_in would then emit duplicate-name members,
+	// violating GLSL/SPIR-V spec uniqueness and breaking linkage.
+	//
+	// Synthetic-range gating (vs. always-dedupe-by-name) preserves API
+	// behavior for non-synthetic-range consumers — the `{loc, comp}`
+	// keying remains the source of truth for natural-range entries.
+	// Only synthetic-range adds are checked against existing entries by
+	// name; if a match exists at any location, the synthetic-range add
+	// is skipped (the natural-range entry is the canonical interface
+	// member).
+	static constexpr uint32_t synthetic_loc_threshold = 0xE0000000u;
+
+	// Path J' Option E.3 (Sprint 6 Phase 1 — paired Class 2A + 2C),
+	// widened by Option E.4 (CKPT39): record insertion order BEFORE
+	// the Option A1 dedupe `return`.
+	//
+	// The orchestrator calls `add_msl_shader_input` in cross-stage
+	// emission order (TCS-out struct field layout). For monolithic-
+	// program TES, the natural-emission IR walk would otherwise lay
+	// out main0_in members in TES IR-ID order, which can differ from
+	// TCS-out struct order — leading to wrong byte offsets when TES
+	// reads the cross-stage buffer (CKPT34 surfaced this:
+	// TCS out_uint(5)/out_struct(8) vs TES out_struct(5)/out_uint(6)).
+	//
+	// Option E.4 widens recording to ALL non-empty-name calls
+	// regardless of synthetic-range. CKPT39 found that the production
+	// β orchestrator passes natural-range locations when the source
+	// has explicit Location decoration (the typical case), and only
+	// escalates to synthetic-range when natural is absent. E.3's
+	// synthetic-range gate therefore captured 0% of typical production
+	// calls — standalone rig PASS, integration FAIL.
+	//
+	// Recording is now uniform (Class 2A discipline — preamble-time
+	// uniform record, no consumer coordination required for
+	// recording itself). Emission gating is the consumer-coordinated
+	// side: `msl_options.input_emission_in_call_order` opts in via
+	// the `MemberSorter::InsertionOrderThenLocationThenBuiltInType`
+	// aspect; default-off preserves `LocationThenBuiltInType` emission
+	// for the public C API consumers (MoltenVK, vkd3d-proton, etc.)
+	// who register inputs without expecting call-order emission.
+	//
+	// Recording widening is observably a no-op when the emission flag
+	// is unset: the list is populated but never consulted by
+	// MemberSorter.
+	if (!si.name.empty())
+	{
+		bool already_recorded = false;
+		for (const auto &existing_name : inputs_by_location_insertion_order)
+		{
+			if (existing_name == si.name)
+			{
+				already_recorded = true;
+				break;
+			}
+		}
+		if (!already_recorded)
+			inputs_by_location_insertion_order.push_back(si.name);
+	}
+
+	if (!si.name.empty() && si.location >= synthetic_loc_threshold)
+	{
+		for (auto &kv : inputs_by_location)
+			if (kv.second.name == si.name)
+				return;
+	}
+	inputs_by_location[LocationComponentPair{si.location, si.component}] = si;
 	if (si.builtin != BuiltInMax && !inputs_by_builtin.count(si.builtin))
 		inputs_by_builtin[si.builtin] = si;
 }
@@ -68,6 +144,149 @@ void CompilerMSL::add_msl_shader_output(const MSLShaderInterfaceVariable &so)
 	outputs_by_location[{so.location, so.component}] = so;
 	if (so.builtin != BuiltInMax && !outputs_by_builtin.count(so.builtin))
 		outputs_by_builtin[so.builtin] = so;
+}
+
+// AppGL fork: post-compile() readout of the canonical MSL interface struct.
+// Walks the cached SPIRType set up by add_interface_block during emission
+// and returns name/location/builtin/type/offset/size for each member.
+// Sanity-checks (in debug builds) that the running offset at end equals the
+// computed total — catches future emitter changes that invalidate the
+// offset accumulation.
+//
+// Implementation note: stage interface block members are NOT decorated with
+// DecorationOffset (that decoration is set on UBO/SSBO members only). So we
+// compute offsets manually using Metal C ABI alignment rules — the same
+// rules the MSL emitter applies when laying out the struct in the emitted
+// MSL source. Sizes come from the public get_declared_struct_member_size,
+// which derives size from the SPIRType without depending on Offset.
+MSLInterfaceLayout CompilerMSL::get_msl_interface_layout(
+    StorageClass storage_class, bool patch) const
+{
+	MSLInterfaceLayout result;
+
+	// Pick the right cached interface variable id. add_interface_block
+	// populates these during compile(); they remain 0 if compile() hasn't
+	// run or if the requested interface isn't present on this stage.
+	VariableID var_id;
+	if (storage_class == StorageClassInput)
+		var_id = patch ? patch_stage_in_var_id : stage_in_var_id;
+	else if (storage_class == StorageClassOutput)
+		var_id = patch ? patch_stage_out_var_id : stage_out_var_id;
+	else
+		return result; // Other storage classes don't have a stage-interface struct.
+
+	if (var_id == ID(0))
+		return result;
+
+	const auto &iface_var = get<SPIRVariable>(var_id);
+	auto &iface_type = get<SPIRType>(iface_var.basetype);
+	if (iface_type.basetype != SPIRType::Struct)
+		return result; // Defensive — interface block should always be a struct.
+
+	const uint32_t mbr_count = static_cast<uint32_t>(iface_type.member_types.size());
+	result.members.reserve(mbr_count);
+
+	auto type_align = [&](const SPIRType &t) -> uint32_t {
+		// Metal C ABI alignment for vector/scalar/matrix:
+		//   scalar:    bit_width / 8  (typically 4 for 32-bit)
+		//   vec2:      2 * scalar_align
+		//   vec3:      4 * scalar_align (vec3 is padded to vec4 alignment)
+		//   vec4:      4 * scalar_align
+		//   matrix:    column-vec alignment
+		uint32_t scalar_align = t.width / 8u;
+		if (scalar_align == 0)
+			scalar_align = 4u; // Defensive default for unsized types.
+		uint32_t vec_align = (t.vecsize == 3u) ? 4u * scalar_align : t.vecsize * scalar_align;
+		return vec_align;
+	};
+
+	// Compute Metal C ABI size for a struct member type, matching the
+	// emitter's MSL output. Handles 1-D arrays directly (stage interface
+	// types are typically scalars, vectors, or 1-D arrays like
+	// gl_ClipDistance[N]). For nested structs we delegate to
+	// get_declared_struct_size; for arrays of structs we compute stride
+	// manually (each element aligned up to its type's alignment) since
+	// stage interface arrays are not ArrayStride-decorated.
+	auto compute_member_size = [&](const SPIRType &t) -> uint32_t {
+		auto element_size = [&](const SPIRType &et) -> uint32_t {
+			if (et.basetype == SPIRType::Struct)
+				return static_cast<uint32_t>(get_declared_struct_size(et));
+			uint32_t scalar = et.width / 8u;
+			if (scalar == 0)
+				scalar = 4u;
+			return scalar * et.vecsize * et.columns;
+		};
+		if (!t.array.empty())
+		{
+			bool literal = t.array_size_literal.back();
+			uint32_t n = literal ? t.array.back() : evaluate_constant_u32(t.array.back());
+			SPIRType elem = t;
+			elem.array.clear();
+			elem.array_size_literal.clear();
+			uint32_t elem_size = element_size(elem);
+			uint32_t elem_align = type_align(elem);
+			if (elem_align > 1)
+				elem_size = (elem_size + elem_align - 1u) & ~(elem_align - 1u);
+			return n * elem_size;
+		}
+		return element_size(t);
+	};
+
+	uint32_t running_offset = 0;
+	uint32_t struct_align = 1;
+
+	for (uint32_t i = 0; i < mbr_count; ++i)
+	{
+		MSLInterfaceMember m;
+		m.name = get_member_name(iface_type.self, i);
+		m.is_builtin = has_member_decoration(iface_type.self, i, DecorationBuiltIn);
+		m.builtin = m.is_builtin ? BuiltIn(get_member_decoration(iface_type.self, i, DecorationBuiltIn))
+		                         : BuiltInMax;
+		m.location = has_member_decoration(iface_type.self, i, DecorationLocation)
+		                 ? get_member_decoration(iface_type.self, i, DecorationLocation)
+		                 : ~0u;
+		m.component = has_member_decoration(iface_type.self, i, DecorationComponent)
+		                  ? get_member_decoration(iface_type.self, i, DecorationComponent)
+		                  : 0u;
+
+		const auto &mbr_type = get<SPIRType>(iface_type.member_types[i]);
+		m.base_type = mbr_type.basetype;
+		m.bit_width = mbr_type.width;
+		m.vecsize = mbr_type.vecsize;
+		m.columns = mbr_type.columns;
+		m.array_size = mbr_type.array.empty() ? 0u : mbr_type.array.front();
+
+		// Align running_offset up to the member's alignment.
+		uint32_t mbr_align = type_align(mbr_type);
+		if (mbr_align > struct_align)
+			struct_align = mbr_align;
+		if (mbr_align > 1)
+			running_offset = (running_offset + mbr_align - 1u) & ~(mbr_align - 1u);
+
+		m.offset = running_offset;
+		m.size = compute_member_size(mbr_type);
+		running_offset += m.size;
+
+		result.members.push_back(std::move(m));
+	}
+
+	result.unpadded_end = running_offset;
+	result.struct_alignment = struct_align;
+	// Pad total to struct alignment (matches Metal's struct sizeof rounding).
+	if (struct_align > 1)
+		result.struct_size = (running_offset + struct_align - 1u) & ~(struct_align - 1u);
+	else
+		result.struct_size = running_offset;
+
+	// Sanity-check (per Clerk's belt-and-suspenders ask): the running offset
+	// after all members must be consistent with the padded total. In release
+	// builds this assertion is a no-op; in debug we abort so the next
+	// emitter change that breaks introspection surfaces immediately.
+	assert(result.members.empty() ||
+	       (result.members.back().offset + result.members.back().size == result.unpadded_end &&
+	        result.unpadded_end <= result.struct_size));
+
+	return result;
 }
 
 void CompilerMSL::add_msl_resource_binding(const MSLResourceBinding &binding)
@@ -266,7 +485,12 @@ void CompilerMSL::build_implicit_builtins()
 	bool need_dispatch_base =
 	    msl_options.dispatch_base && get_execution_model() == ExecutionModelGLCompute &&
 	    (active_input_builtins.get(BuiltInWorkgroupId) || active_input_builtins.get(BuiltInGlobalInvocationId));
-	bool need_grid_params = get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation;
+	// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute also needs the
+	// grid-params synthesis so `builtin_invocation_id_id` gets a valid
+	// BuiltInGlobalInvocationId variable — the output index
+	// `spvOut[gl_GlobalInvocationID.x]` depends on this.
+	bool need_grid_params = (get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation) ||
+	                         (get_execution_model() == ExecutionModelTessellationEvaluation && msl_options.tess_evaluation_as_compute);
 	bool need_vertex_base_params =
 	    need_grid_params &&
 	    (active_input_builtins.get(BuiltInVertexId) || active_input_builtins.get(BuiltInVertexIndex) ||
@@ -1655,7 +1879,12 @@ void CompilerMSL::emit_entry_point_declarations()
 	}
 
 	// Holds SetMeshOutputsEXT information. Threadgroup since first thread wins.
-	if (processing_entry_point && is_mesh_shader())
+	// GS-as-mesh tracks vertex/primitive counts via function-local
+	// spvVertexIndex/spvPrimitiveIndex incremented by EmitVertex/EndPrimitive,
+	// so spvMeshSizes is dead in that mode.
+	if (processing_entry_point && is_mesh_shader() &&
+	    !(msl_options.geometry_shader_as_mesh &&
+	      get_execution_model() == ExecutionModelGeometry))
 		statement("threadgroup uint2 spvMeshSizes;");
 }
 
@@ -1731,6 +1960,50 @@ string CompilerMSL::compile()
 
 	build_function_control_flow_graphs_and_analyze();
 	update_active_builtins();
+	// AppGL fork (msl-tcs-output-classification.patch): classify TCS
+	// outputs by whether the linked TES consumes them. Must run after
+	// update_active_builtins (so builtin classification is settled) and
+	// before any emission walks variables (so the mask is in place
+	// before is_stage_output_variable_masked is consulted).
+	classify_tcs_outputs_by_consumption();
+	// AppGL fork (msl-geometry-shader-as-mesh.patch): synthesize
+	// DecorationPerPrimitiveEXT on GS output builtins that are
+	// per-primitive in mesh shader form (gl_Layer, gl_ViewportIndex,
+	// gl_PrimitiveID-output). Without this, the existing meshlet block
+	// builder (`add_meshlet_block`) classifies them into spvPerVertex,
+	// which Metal then rejects with "invalid attribute
+	// 'render_target_array_index' for mesh vertex output declaration".
+	// Must run before build_implicit_builtins (which populates
+	// mesh_out_per_vertex / mesh_out_per_primitive struct types).
+	if (msl_options.geometry_shader_as_mesh && get_execution_model() == ExecutionModelGeometry)
+	{
+		// Force include of spvUnsafeArray template — the trailing emit
+		// uses `spvUnsafeArray<spvPerVertex, MAX_V>` for the local
+		// per-vertex output buffer, but if no other emission site
+		// triggers the include first, the template would be missing.
+		add_spv_func_and_recompile(SPVFuncImplUnsafeArray);
+
+		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+			if (var.storage != StorageClassOutput)
+				return;
+			if (!has_decoration(var.self, DecorationBuiltIn))
+				return;
+			BuiltIn builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
+			if (builtin == BuiltInLayer ||
+			    builtin == BuiltInViewportIndex ||
+			    builtin == BuiltInPrimitiveId)
+			{
+				if (!has_decoration(var.self, DecorationPerPrimitiveEXT))
+					set_decoration(var.self, DecorationPerPrimitiveEXT);
+			}
+		});
+
+		// Phase 2.5 Gap A: synthesize gl_Position Output if absent.
+		// Mesh shader vertex types must declare a [[position]] member;
+		// GS sources that don't write gl_Position (TF-only / depth-only)
+		// produce position-less spvPerVertex which Metal rejects.
+		ensure_gs_as_mesh_position_output();
+	}
 	analyze_image_and_sampler_usage();
 	analyze_sampled_image_usage();
 	analyze_interlocked_resource_usage();
@@ -1776,12 +2049,46 @@ string CompilerMSL::compile()
 	if (builtin_frag_depth_id)
 		add_active_interface_variable(builtin_frag_depth_id);
 
+	// Path J' Option E: pre-populate inputs_by_location with natural
+	// Input variable entries (name + location + component) and dedupe
+	// any synthetic-range entries whose names match. Must run before
+	// add_interface_block(StorageClassInput) consumes the map.
+	pre_populate_inputs_by_location_from_ir();
+
 	// Create structs to hold input, output and uniform variables.
 	// Do output first to ensure out. is declared at top of entry function.
 	qual_pos_var_name = "";
 	if (is_mesh_shader())
 	{
 		fixup_implicit_builtin_block_names(get_execution_model());
+		// GS-as-mesh: build the input interface block too. The native
+		// MeshEXT path doesn't have stage inputs (object stage feeds
+		// payload instead), but a GS-as-mesh translation needs a
+		// device-buffer-typed VS-output input the [[mesh]] entry can
+		// read at threadgroup_position_in_grid * verticesPerPrimitive.
+		// Drives the `device const main0_in* spvVsOutputs [[buffer(K)]]`
+		// parameter + the per-vertex population in fixup_hooks_in.
+		if (msl_options.geometry_shader_as_mesh &&
+		    get_execution_model() == ExecutionModelGeometry)
+		{
+			stage_in_var_id = add_interface_block(StorageClassInput);
+			// Path A++ gate 7: shared-struct-layout-parity primitive.
+			// Force gl_ClipDistance / gl_CullDistance into main0_in so it
+			// matches the linked-VS main0_out byte-for-byte even when the
+			// GS doesn't read those members. Without this, VS-compute
+			// writes 32 B per vertex (Position + PointSize +
+			// ClipDistance[1]) while mesh reads 24 B per vertex
+			// (Position + PointSize) — first vertex aligns, subsequent
+			// vertices misalign and the GS reads garbage.
+			//
+			// Source of truth for array size: the GS's input
+			// gl_PerVertex_0 block in SPIR-V (declared by the GLSL
+			// `in gl_PerVertex { ... } gl_in[];` interface). Mirrors
+			// VS's main0_out shape because both are emitted from the
+			// same gl_PerVertex SPIR-V block on the linked program.
+			if (stage_in_var_id)
+				ensure_gs_as_mesh_gl_per_vertex_parity();
+		}
 	}
 	else
 	{
@@ -2998,6 +3305,8 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
 	auto &var_type = meta.strip_array ? get_variable_element_type(var) : get_variable_data_type(var);
 	uint32_t elem_cnt = 0;
+	bool is_array_of_matrix = false;
+	uint32_t array_matrix_columns = 0;
 
 	if (add_component_variable_to_interface_block(storage, ib_var_ref, var, var_type, meta))
 		return;
@@ -3005,9 +3314,14 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 	if (is_matrix(var_type))
 	{
 		if (is_array(var_type))
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-		elem_cnt = var_type.columns;
+		{
+			auto &matrix_type = get<SPIRType>(var_type.parent_type);
+			is_array_of_matrix = true;
+			array_matrix_columns = matrix_type.columns;
+			elem_cnt = to_array_size_literal(var_type) * array_matrix_columns;
+		}
+		else
+			elem_cnt = var_type.columns;
 	}
 	else if (is_array(var_type))
 	{
@@ -3029,6 +3343,11 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 		usable_type = &get<SPIRType>(usable_type->parent_type);
 	while (is_array(*usable_type) || is_matrix(*usable_type))
 		usable_type = &get<SPIRType>(usable_type->parent_type);
+	auto flat_index_expr = [&](uint32_t idx) -> string {
+		if (is_array_of_matrix)
+			return join("[", idx / array_matrix_columns, "][", idx % array_matrix_columns, "]");
+		return join("[", idx, "]");
+	};
 
 	// If a builtin, force it to have the proper name.
 	if (is_builtin)
@@ -3158,43 +3477,44 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 		{
 			switch (storage)
 			{
-			case StorageClassInput:
-				entry_func.fixup_hooks_in.push_back([=, &var]() {
-					if (pull_model_inputs.count(var.self))
-					{
-						string lerp_call;
-						if (is_centroid)
-							lerp_call = ".interpolate_at_centroid()";
-						else if (is_sample)
-							lerp_call = join(".interpolate_at_sample(", to_expression(builtin_sample_id_id), ")");
+				case StorageClassInput:
+					entry_func.fixup_hooks_in.push_back([=, &var]() {
+						if (pull_model_inputs.count(var.self))
+						{
+							string lerp_call;
+							if (is_centroid)
+								lerp_call = ".interpolate_at_centroid()";
+							else if (is_sample)
+								lerp_call = join(".interpolate_at_sample(", to_expression(builtin_sample_id_id), ")");
+							else
+								lerp_call = ".interpolate_at_center()";
+							statement(to_name(var.self), flat_index_expr(i), " = ", ib_var_ref, ".", mbr_name, lerp_call, ";");
+						}
 						else
-							lerp_call = ".interpolate_at_center()";
-						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, lerp_call, ";");
-					}
-					else
-					{
-						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, ";");
-					}
-				});
-				break;
+						{
+							statement(to_name(var.self), flat_index_expr(i), " = ", ib_var_ref, ".", mbr_name, ";");
+						}
+					});
+					break;
 
-			case StorageClassOutput:
-				entry_func.fixup_hooks_out.push_back([=, &var]() {
-					if (padded_output)
-					{
-						auto &padded_type = this->get<SPIRType>(type_id);
-						statement(
-						    ib_var_ref, ".", mbr_name, " = ",
-						    remap_swizzle(padded_type, usable_type->vecsize, join(to_name(var.self), "[", i, "]")),
-						    ";");
-					}
-					else if (flatten_from_ib_var)
-						statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i,
-						          "];");
-					else
-						statement(ib_var_ref, ".", mbr_name, " = ", to_name(var.self), "[", i, "];");
-				});
-				break;
+				case StorageClassOutput:
+					entry_func.fixup_hooks_out.push_back([=, &var]() {
+						string var_ref = join(to_name(var.self), flat_index_expr(i));
+						if (padded_output)
+						{
+							auto &padded_type = this->get<SPIRType>(type_id);
+							statement(
+							    ib_var_ref, ".", mbr_name, " = ",
+							    remap_swizzle(padded_type, usable_type->vecsize, var_ref),
+							    ";");
+						}
+						else if (flatten_from_ib_var)
+							statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i,
+							          "];");
+						else
+							statement(ib_var_ref, ".", mbr_name, " = ", var_ref, ";");
+					});
+					break;
 
 			default:
 				break;
@@ -3243,14 +3563,24 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 	auto &mbr_type = get<SPIRType>(mbr_type_id);
 
 	bool mbr_is_indexable = false;
+	bool mbr_is_array_of_matrix = false;
+	uint32_t mbr_array_matrix_columns = 0;
 	uint32_t elem_cnt = 1;
 	if (is_matrix(mbr_type))
 	{
 		if (is_array(mbr_type))
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-		mbr_is_indexable = true;
-		elem_cnt = mbr_type.columns;
+		{
+			auto &matrix_type = get<SPIRType>(mbr_type.parent_type);
+			mbr_is_indexable = true;
+			mbr_is_array_of_matrix = true;
+			mbr_array_matrix_columns = matrix_type.columns;
+			elem_cnt = to_array_size_literal(mbr_type) * mbr_array_matrix_columns;
+		}
+		else
+		{
+			mbr_is_indexable = true;
+			elem_cnt = mbr_type.columns;
+		}
 	}
 	else if (is_array(mbr_type))
 	{
@@ -3266,6 +3596,11 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		usable_type = &get<SPIRType>(usable_type->parent_type);
 	while (is_array(*usable_type) || is_matrix(*usable_type))
 		usable_type = &get<SPIRType>(usable_type->parent_type);
+	auto member_flat_index_expr = [&](uint32_t idx) -> string {
+		if (mbr_is_array_of_matrix)
+			return join("[", idx / mbr_array_matrix_columns, "][", idx % mbr_array_matrix_columns, "]");
+		return mbr_is_indexable ? join("[", idx, "]") : "";
+	};
 
 	bool flatten_from_ib_var = false;
 	string flatten_from_ib_mbr_name;
@@ -3294,7 +3629,7 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		for (uint32_t i = 0; i < elem_cnt; i++)
 		{
 			string mbr_name = append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? join("_", i) : "");
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), member_flat_index_expr(i));
 			uint32_t sub_mbr_cnt = uint32_t(mbr_type.member_types.size());
 			for (uint32_t sub_mbr_idx = 0; sub_mbr_idx < sub_mbr_cnt; sub_mbr_idx++)
 			{
@@ -3411,7 +3746,7 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		// Unflatten or flatten from [[stage_in]] or [[stage_out]] as appropriate.
 		if (!meta.strip_array && meta.allow_local_declaration)
 		{
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), member_flat_index_expr(i));
 			switch (storage)
 			{
 			case StorageClassInput:
@@ -3741,11 +4076,31 @@ void CompilerMSL::add_tess_level_input(const std::string &base_ref, const std::s
 	vars_needing_early_declaration.push_back(var.self);
 	bool triangles = is_tessellating_triangles();
 
+	// Path L: when the full-precision shadow buffer flag is on, route
+	// reads to `spvTessLevelFull[primId * stride + index]` instead of
+	// the half-precision struct member access. The buffer layout per
+	// primitive: outer levels first, then inner levels. Stride depends
+	// on domain (triangles=4, quads=6, isolines=2). Read pattern is
+	// uniform across builtins via the shared stride math.
+	bool use_full_precision = msl_options.use_full_precision_tess_level_buffer;
+	bool isolines = get_entry_point().flags.get(ExecutionModeIsolines);
+	uint32_t outer_count = isolines ? 2u : (triangles ? 3u : 4u);
+	uint32_t inner_count = isolines ? 0u : (triangles ? 1u : 2u);
+	uint32_t stride = outer_count + inner_count;
+	uint32_t var_self = var.self;
+
 	if (builtin == BuiltInTessLevelOuter)
 	{
 		entry_func.fixup_hooks_in.push_back(
 		    [=]()
 		    {
+			    if (use_full_precision)
+			    {
+				    for (uint32_t i = 0; i < outer_count; ++i)
+					    statement(var_name, "[", i, "] = spvTessLevelFull[",
+					              to_expression(builtin_primitive_id_id), " * ", stride, "u + ", i, "u];");
+				    return;
+			    }
 			    statement(var_name, "[0] = ", base_ref, ".", mbr_name, "[0];");
 			    statement(var_name, "[1] = ", base_ref, ".", mbr_name, "[1];");
 			    statement(var_name, "[2] = ", base_ref, ".", mbr_name, "[2];");
@@ -3756,6 +4111,14 @@ void CompilerMSL::add_tess_level_input(const std::string &base_ref, const std::s
 	else
 	{
 		entry_func.fixup_hooks_in.push_back([=]() {
+			if (use_full_precision)
+			{
+				for (uint32_t i = 0; i < inner_count; ++i)
+					statement(var_name, "[", i, "] = spvTessLevelFull[",
+					          to_expression(builtin_primitive_id_id), " * ", stride, "u + ",
+					          outer_count, "u + ", i, "u];");
+				return;
+			}
 			if (triangles)
 			{
 				if (msl_options.raw_buffer_tese_input)
@@ -3770,6 +4133,7 @@ void CompilerMSL::add_tess_level_input(const std::string &base_ref, const std::s
 			}
 		});
 	}
+	(void)var_self;
 }
 
 bool CompilerMSL::variable_storage_requires_stage_io(StorageClass storage) const
@@ -3966,6 +4330,34 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 					is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
 					auto &mbr_type = get<SPIRType>(var_type.member_types[mbr_idx]);
 
+					// AppGL patch (phase-3-tess-struct-parity): for tess
+					// capture-buffer interfaces — VS output in
+					// `vertex_for_tessellation + capture_output_to_buffer`,
+					// TCS input in `multi_patch_workgroup`, TES input in
+					// `raw_buffer_tese_input` — force gl_PerVertex
+					// builtin members to be included regardless of
+					// `has_active_builtin`. Otherwise VS's main0_out can
+					// emit gl_PointSize (because VS writes it) while
+					// TCS's main0_in prunes it (because TCS doesn't read
+					// it), producing a struct-stride mismatch that
+					// breaks the typed `device main0_in*` pointer math
+					// inside the TCS MSL. Pad-inclusion keeps both sides
+					// in lockstep at the cost of a few unused bytes.
+					const bool tess_capture_buffer_interface =
+						(storage == StorageClassOutput &&
+						 ((get_execution_model() == ExecutionModelVertex &&
+						   msl_options.vertex_for_tessellation &&
+						   msl_options.capture_output_to_buffer) ||
+						  (is_tesc_shader() && msl_options.multi_patch_workgroup) ||
+						  (is_tese_shader() && msl_options.tess_evaluation_as_compute))) ||
+						(storage == StorageClassInput &&
+						 ((is_tesc_shader() && msl_options.multi_patch_workgroup) ||
+						  (is_tese_shader() && msl_options.raw_buffer_tese_input) ||
+						  (msl_options.geometry_shader_as_mesh &&
+						   get_execution_model() == ExecutionModelGeometry)));
+					const bool force_include_builtin =
+						tess_capture_buffer_interface && is_builtin;
+
 					if (storage == StorageClassOutput && is_stage_output_block_member_masked(var, mbr_idx, meta.strip_array))
 					{
 						location = UINT32_MAX; // Skip this member and resolve location again on next var member
@@ -4001,12 +4393,13 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 							set_decoration(var_id, DecorationBuiltIn, builtin);
 						}
 					}
-					else if (!is_builtin || has_active_builtin(builtin, storage))
+					else if (!is_builtin || has_active_builtin(builtin, storage) || force_include_builtin)
 					{
 						bool is_composite_type = is_matrix(mbr_type) || is_array(mbr_type) || mbr_type.basetype == SPIRType::Struct;
 						bool attribute_load_store =
 								storage == StorageClassInput && get_execution_model() != ExecutionModelFragment;
 						bool storage_is_stage_io = variable_storage_requires_stage_io(storage);
+
 
 						// Clip/CullDistance always need to be declared as user attributes.
 						if (builtin == BuiltInClipDistance || builtin == BuiltInCullDistance)
@@ -4184,6 +4577,15 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 	// Accumulate the variables that should appear in the interface struct.
 	SmallVector<SPIRVariable *> vars;
 	bool incl_builtins = storage == StorageClassOutput || is_tessellation_shader();
+	// GS-as-mesh: include builtin block inputs (gl_in) so their members
+	// flatten into main0_in for the device-buffer-typed VS-output read
+	// path. Without this, is_hidden_variable hides gl_in (since the GS
+	// gl_PerVertex block carries member-level builtin decorations) and
+	// gl_Position never reaches the interface struct.
+	if (msl_options.geometry_shader_as_mesh &&
+	    get_execution_model() == ExecutionModelGeometry &&
+	    storage == StorageClassInput)
+		incl_builtins = true;
 	bool has_seen_barycentric = false;
 
 	InterfaceBlockMeta meta;
@@ -4416,9 +4818,33 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 				entry_func.fixup_hooks_in.push_back(
 				    [=]()
 				    {
-					    statement("const device ", to_name(ir.default_entry_point), "_", ib_var_ref, "* gl_in = &",
-					              input_buffer_var_name, "[", to_expression(builtin_primitive_id_id), " * ",
-					              get_entry_point().output_vertices, "];");
+					    // Path K' (Sprint 4 Phase 1, sub-cluster A — extension):
+					    // gl_in array stride for raw_buffer_tese_input. When
+					    // `tese_input_patch_vertices` is 0 AND the TES has no
+					    // own `output_vertices` execution mode (TES-only
+					    // programs without a sibling TCS), fall through to
+					    // runtime read from `spvIndirectParams[0]` instead
+					    // of emitting a 0 stride. Parallels Path K's fix at
+					    // BuiltInPatchVertices emission — same root cause
+					    // (link-side TCS state isn't visible to TES SPIR-V),
+					    // same fix shape (runtime read).
+					    uint32_t output_verts = get_entry_point().output_vertices;
+					    uint32_t patch_cp = msl_options.tese_input_patch_vertices != 0
+					                            ? msl_options.tese_input_patch_vertices
+					                            : output_verts;
+					    if (patch_cp != 0)
+					    {
+						    statement("const device ", to_name(ir.default_entry_point), "_", ib_var_ref, "* gl_in = &",
+						              input_buffer_var_name, "[", to_expression(builtin_primitive_id_id), " * ",
+						              patch_cp, "];");
+					    }
+					    else
+					    {
+						    // Runtime read — patch_cp known only at draw time.
+						    statement("const device ", to_name(ir.default_entry_point), "_", ib_var_ref, "* gl_in = &",
+						              input_buffer_var_name, "[", to_expression(builtin_primitive_id_id),
+						              " * spvIndirectParams[0]];");
+					    }
 				    });
 			}
 			break;
@@ -4471,9 +4897,26 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 						// We zero-base the InstanceID & VertexID variables for HLSL emulation elsewhere, so don't do it twice
 						if (get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation)
 						{
-							statement("device ", to_name(ir.default_entry_point), "_", ib_var_ref, "& ", ib_var_ref,
+							// Path E++: when the spvOut buffer parameter is
+							// `volatile device main0_out*`, the local reference
+							// must also carry the `volatile` qualifier — C++
+							// disallows binding a `device T&` to a
+							// `volatile device T` lvalue (drops volatile).
+							const char *vol_pfx =
+								msl_options.force_compute_kernel_device_volatile_writes ? "volatile " : "";
+							statement(vol_pfx, "device ", to_name(ir.default_entry_point), "_", ib_var_ref, "& ", ib_var_ref,
 							          " = ", output_buffer_var_name, "[", to_expression(builtin_invocation_id_id),
 							          ".y * ", to_expression(builtin_stage_input_size_id), ".x + ",
+							          to_expression(builtin_invocation_id_id), ".x];");
+						}
+						// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute
+						// indexes spvOut by thread_position_in_grid.x — one
+						// output vertex per dispatched kernel thread.
+						else if (get_execution_model() == ExecutionModelTessellationEvaluation &&
+						         msl_options.tess_evaluation_as_compute)
+						{
+							statement("device ", to_name(ir.default_entry_point), "_", ib_var_ref, "& ", ib_var_ref,
+							          " = ", output_buffer_var_name, "[",
 							          to_expression(builtin_invocation_id_id), ".x];");
 						}
 						else if (msl_options.enable_base_index_zero)
@@ -4553,6 +4996,19 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 	{
 		bool strip_array = (is_tesc_shader() || (is_tese_shader() && storage == StorageClassInput)) && !patch;
 
+		// GS-as-mesh: strip the array dimension on input variables so the
+		// generated main0_in struct is per-vertex (matches the linked VS's
+		// per-vertex output struct shape). The mesh threadgroup reads
+		// spvVsOutputs[primitiveID * verticesPerPrim + i] for each
+		// per-vertex input — without strip_array the struct flattens to
+		// `in_color_0`/`in_color_1`/... per-primitive, which is the wrong
+		// shape for VS→GS data flow. Mirrors `multi_patch_workgroup`
+		// strip_array=true for TCS input.
+		if (msl_options.geometry_shader_as_mesh &&
+		    get_execution_model() == ExecutionModelGeometry &&
+		    storage == StorageClassInput)
+			strip_array = true;
+
 		// Fixing up flattened stores in TESC is impossible since the memory is group shared either via
 		// device (not masked) or threadgroup (masked) storage classes and it's race condition city.
 		meta.strip_array = strip_array;
@@ -4566,6 +5022,12 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 	{
 		// For tessellation inputs, add all outputs from the previous stage to ensure
 		// the struct containing them is the correct size and layout.
+		//
+		// (Path J' Option E.3 note: iteration order here is map-key order;
+		// final struct member layout is post-sorted by `MemberSorter`
+		// below, which uses the `InsertionOrderThenLocationThenBuiltInType`
+		// aspect when `inputs_by_location_insertion_order` is non-empty.
+		// MemberSorter is the single source of truth for emission order.)
 		for (auto &input : inputs_by_location)
 		{
 			if (location_inputs_in_use.count(input.first.location) != 0)
@@ -4730,8 +5192,32 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationSample);
 	}
 
-	// Sort the members of the structure by their locations.
-	MemberSorter member_sorter(ib_type, ir.meta[ib_type_id], MemberSorter::LocationThenBuiltInType);
+	// Sort the members of the structure by their locations (or by the
+	// orchestrator's `add_msl_shader_input` call sequence when that
+	// signal is present and explicitly opted in via
+	// `msl_options.input_emission_in_call_order` — see Path J'
+	// Option E.3 / Option E.4).
+	//
+	// Path J' Option E.4 (Sprint 6 Phase 1 — paired Class 2A + 2C
+	// extension after CKPT39 rig-vs-integration symmetry violation):
+	// gate the new sort aspect on an explicit option flag rather than
+	// the implicit "list non-empty" condition E.3 used. CKPT39 surfaced
+	// that recording widened by E.4 captures all add_msl_shader_input
+	// calls (both natural-range and synthetic-range), but emission must
+	// stay opt-in to preserve back-compat for public C API consumers
+	// (MoltenVK, vkd3d-proton) who register inputs via the same path
+	// without expecting call-order emission. AppGL fork orchestrators
+	// set `input_emission_in_call_order = true` to engage the new
+	// aspect; default-off preserves `LocationThenBuiltInType` emission.
+	MemberSorter::SortAspect chosen_aspect = MemberSorter::LocationThenBuiltInType;
+	if (msl_options.input_emission_in_call_order &&
+	    storage == StorageClassInput &&
+	    !inputs_by_location_insertion_order.empty())
+		chosen_aspect = MemberSorter::InsertionOrderThenLocationThenBuiltInType;
+
+	MemberSorter member_sorter(ib_type, ir.meta[ib_type_id], chosen_aspect);
+	if (chosen_aspect == MemberSorter::InsertionOrderThenLocationThenBuiltInType)
+		member_sorter.insertion_order = &inputs_by_location_insertion_order;
 	member_sorter.sort();
 
 	// The member indices were saved to the original variables, but after the members
@@ -4856,6 +5342,414 @@ uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
 		set_name(type.self, "spvPerVertex");
 
 	return next_id;
+}
+
+// Path A++ gate 7: shared-struct layout parity for GS-as-mesh.
+//
+// The existing add_interface_block flatten loop emits gl_ClipDistance and
+// gl_CullDistance for VS-Output (`vertex_for_tessellation +
+// capture_output_to_buffer`) but silently drops them for GS-Input
+// (`geometry_shader_as_mesh`) because the array-typed builtin path
+// behind the storage_is_stage_io+is_composite_type gate at
+// `add_variable_to_interface_block` doesn't follow through to the
+// member emit. Result: VS writes 32 B/vertex (Position+PointSize+
+// ClipDistance[1]), GS reads 24 B/vertex (Position+PointSize) — first
+// vertex aligns by accident, subsequent vertices land at wrong offsets.
+//
+// Post-pass: walk the GS's input gl_PerVertex block in IR, find the
+// gl_ClipDistance / gl_CullDistance member declarations and their
+// array sizes, and inject them into main0_in if absent. Source of
+// truth is the SPIR-V input block — same block shape the linked VS's
+// main0_out is emitted from, so byte parity falls out automatically.
+void CompilerMSL::ensure_gs_as_mesh_gl_per_vertex_parity()
+{
+	if (!stage_in_var_id)
+		return;
+
+	auto &ib_type = get_stage_in_struct_type();
+
+	auto has_member_with_builtin = [&](BuiltIn b) {
+		for (uint32_t i = 0; i < uint32_t(ib_type.member_types.size()); ++i)
+		{
+			if (has_member_decoration(ib_type.self, i, DecorationBuiltIn) &&
+			    BuiltIn(get_member_decoration(ib_type.self, i, DecorationBuiltIn)) == b)
+				return true;
+		}
+		return false;
+	};
+
+	// Find the GS's input gl_PerVertex block in IR — it's a Block-decorated
+	// struct that's the element type of an Input-storage-class array
+	// variable (gl_in). Iterate Input variables, peel pointer + array,
+	// find the one with DecorationBlock and gl_PerVertex builtin members.
+	const SPIRType *gl_per_vertex_in = nullptr;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		if (gl_per_vertex_in)
+			return;
+		if (var.storage != StorageClassInput)
+			return;
+		const auto &element_type = get_variable_element_type(var);
+		if (!has_decoration(element_type.self, DecorationBlock))
+			return;
+		// Confirm gl_PerVertex shape — at least one member with
+		// BuiltIn Position decoration.
+		bool has_position_member = false;
+		for (uint32_t i = 0; i < uint32_t(element_type.member_types.size()); ++i)
+		{
+			if (has_member_decoration(element_type.self, i, DecorationBuiltIn) &&
+			    BuiltIn(get_member_decoration(element_type.self, i, DecorationBuiltIn)) ==
+			        BuiltInPosition)
+			{
+				has_position_member = true;
+				break;
+			}
+		}
+		if (has_position_member)
+			gl_per_vertex_in = &element_type;
+	});
+
+	if (!gl_per_vertex_in)
+		return;
+
+	// For each clip/cull distance member in the source gl_PerVertex,
+	// inject into main0_in if absent. Carries name + array size
+	// from the IR member; member type is the same SPIRType ID so
+	// no fresh type creation needed.
+	auto inject = [&](BuiltIn b, const char *member_name) {
+		if (has_member_with_builtin(b))
+			return;
+		uint32_t src_mbr_idx = UINT32_MAX;
+		for (uint32_t i = 0; i < uint32_t(gl_per_vertex_in->member_types.size()); ++i)
+		{
+			if (has_member_decoration(gl_per_vertex_in->self, i, DecorationBuiltIn) &&
+			    BuiltIn(get_member_decoration(gl_per_vertex_in->self, i, DecorationBuiltIn)) == b)
+			{
+				src_mbr_idx = i;
+				break;
+			}
+		}
+		if (src_mbr_idx == UINT32_MAX)
+			return;
+		uint32_t mbr_type_id = gl_per_vertex_in->member_types[src_mbr_idx];
+		uint32_t new_idx = uint32_t(ib_type.member_types.size());
+		ib_type.member_types.push_back(mbr_type_id);
+		set_member_name(ib_type.self, new_idx, member_name);
+		set_member_decoration(ib_type.self, new_idx, DecorationBuiltIn, b);
+	};
+
+	inject(BuiltInClipDistance, "gl_ClipDistance");
+	inject(BuiltInCullDistance, "gl_CullDistance");
+}
+
+// Phase 2.5 Gap B: emit the EndPrimitive flush sequence for GS-as-mesh.
+// Shared between explicit OpEndPrimitive and Path H implicit
+// function-exit flush. For triangle_strip / line_strip with
+// max_vertices > simple-case-threshold, emits a strip-to-list
+// expansion loop with proper winding alternation per GL §10.1.13.
+// For max_vertices within the simple-case threshold (≤3 triangles,
+// ≤2 lines), emits the single-primitive simple form to preserve
+// byte-identical output for the existing rig fixtures.
+void CompilerMSL::emit_gs_as_mesh_endprimitive()
+{
+	auto &execution = get_entry_point();
+	uint32_t mv = execution.output_vertices;
+	if (execution.flags.get(ExecutionModeOutputTriangleStrip))
+	{
+		if (mv <= 3)
+		{
+			// Simple case: 1 triangle from the last 3 vertices in the
+			// current strip. Byte-identical to pre-Gap-B emission.
+			statement("spvMesh.set_index(spvPrimitiveIndex * 3u + 0u, spvVertexIndex - 3u);");
+			statement("spvMesh.set_index(spvPrimitiveIndex * 3u + 1u, spvVertexIndex - 2u);");
+			statement("spvMesh.set_index(spvPrimitiveIndex * 3u + 2u, spvVertexIndex - 1u);");
+			if (mesh_out_per_primitive != 0)
+				statement("spvMesh.set_primitive(spvPrimitiveIndex, spvCurrentPrim);");
+			statement("++spvPrimitiveIndex;");
+		}
+		else
+		{
+			// Strip-to-list expansion: a strip of N vertices represents
+			// (N-2) triangles with alternating winding per GL §10.1.13.
+			// Even-indexed triangles use (T, T+1, T+2); odd-indexed
+			// triangles use (T+1, T, T+2) so consecutive triangles
+			// share an edge with consistent winding.
+			statement("for (uint spvT = spvStripStart; spvT + 2u < spvVertexIndex; ++spvT)");
+			begin_scope();
+			statement("uint spvLocal = spvT - spvStripStart;");
+			statement("uint spvI0 = (spvLocal & 1u) == 0u ? spvT : spvT + 1u;");
+			statement("uint spvI1 = (spvLocal & 1u) == 0u ? spvT + 1u : spvT;");
+			statement("uint spvI2 = spvT + 2u;");
+			statement("spvMesh.set_index((spvPrimitiveIndex + spvLocal) * 3u + 0u, spvI0);");
+			statement("spvMesh.set_index((spvPrimitiveIndex + spvLocal) * 3u + 1u, spvI1);");
+			statement("spvMesh.set_index((spvPrimitiveIndex + spvLocal) * 3u + 2u, spvI2);");
+			if (mesh_out_per_primitive != 0)
+				statement("spvMesh.set_primitive(spvPrimitiveIndex + spvLocal, spvCurrentPrim);");
+			end_scope();
+			statement("spvPrimitiveIndex += (spvVertexIndex - spvStripStart >= 2u) ? "
+			          "(spvVertexIndex - spvStripStart - 2u) : 0u;");
+		}
+	}
+	else if (execution.flags.get(ExecutionModeOutputLineStrip))
+	{
+		if (mv <= 2)
+		{
+			// Simple case: 1 line from the last 2 vertices in the strip.
+			statement("spvMesh.set_index(spvPrimitiveIndex * 2u + 0u, spvVertexIndex - 2u);");
+			statement("spvMesh.set_index(spvPrimitiveIndex * 2u + 1u, spvVertexIndex - 1u);");
+			if (mesh_out_per_primitive != 0)
+				statement("spvMesh.set_primitive(spvPrimitiveIndex, spvCurrentPrim);");
+			statement("++spvPrimitiveIndex;");
+		}
+		else
+		{
+			// Strip expansion: a line strip of N vertices = (N-1) line
+			// segments, each segment using consecutive vertices.
+			statement("for (uint spvT = spvStripStart; spvT + 1u < spvVertexIndex; ++spvT)");
+			begin_scope();
+			statement("uint spvLocal = spvT - spvStripStart;");
+			statement("spvMesh.set_index((spvPrimitiveIndex + spvLocal) * 2u + 0u, spvT);");
+			statement("spvMesh.set_index((spvPrimitiveIndex + spvLocal) * 2u + 1u, spvT + 1u);");
+			if (mesh_out_per_primitive != 0)
+				statement("spvMesh.set_primitive(spvPrimitiveIndex + spvLocal, spvCurrentPrim);");
+			end_scope();
+			statement("spvPrimitiveIndex += (spvVertexIndex - spvStripStart >= 1u) ? "
+			          "(spvVertexIndex - spvStripStart - 1u) : 0u;");
+		}
+	}
+	else if (execution.flags.get(ExecutionModeOutputPoints))
+	{
+		// Points: 1 vertex per primitive; max_vertices irrelevant.
+		statement("spvMesh.set_index(spvPrimitiveIndex, spvVertexIndex - 1u);");
+		if (mesh_out_per_primitive != 0)
+			statement("spvMesh.set_primitive(spvPrimitiveIndex, spvCurrentPrim);");
+		statement("++spvPrimitiveIndex;");
+	}
+	// Reset strip-start tracker for the next strip after this flush.
+	statement("spvStripStart = spvVertexIndex;");
+}
+
+// Path J' Option E: walks SPIR-V Input variables at compile() preamble
+// and populates `inputs_by_location` with each natural Input variable's
+// {location, component, name}. After population, removes any
+// synthetic-range entry (location >= 0xE0000000) whose name matches a
+// natural-range entry — synthetic-range entry was added by the
+// consumer to drive cross-stage matching but the natural-range entry
+// is canonical for emission.
+//
+// Coordinates with Path J' Option A1 (fce60f8 — synthetic-range dedupe
+// at `add_msl_shader_input` call time):
+//   - Option A1 fires when consumers add synthetic-range entries
+//     AFTER compile() pre-population has run (rare).
+//   - Option E catches the typical case where consumers register
+//     synthetic-range entries BEFORE compile() (Option A1's add-time
+//     check can't see naturally-emitted Input variables yet because
+//     they're not in `inputs_by_location` until pre-population runs).
+//
+// Combined effect: `inputs_by_location` is canonical for both
+// API-registered AND natural-emission entries by the time
+// `add_interface_block(StorageClassInput)` consumes the map.
+//
+// Class 2A spec-compliance — natural-emission entries having unique
+// names is GLSL/SPIR-V spec-mandated; populating the canonical map
+// is consistent with the spec contract. Default-on, no consumer
+// coordination required (the `add_msl_shader_input` API surface
+// is unchanged; consumers calling it get the same behavior;
+// consumers not calling it now have natural entries populated for
+// downstream coordination).
+void CompilerMSL::pre_populate_inputs_by_location_from_ir()
+{
+	static constexpr uint32_t synthetic_loc_threshold = 0xE0000000u;
+
+	// Pass 1: gather natural Input variable NAMES regardless of
+	// Location decoration. Tracks two structures:
+	//  - `natural_with_loc` (name → loc/comp): only entries with valid
+	//    OpDecorate Location, used by Pass 2 to populate
+	//    `inputs_by_location` with canonical map entries.
+	//  - `natural_names` (name set): ALL named natural entries, used
+	//    by Pass 3's name-based dedupe.
+	//
+	// Path J' Option E.2 (CKPT31): widen Pass 1's name capture to
+	// monolithic-program TES inputs that have a name but lack
+	// OpDecorate Location (linkers don't always emit explicit Location
+	// decorations for inputs whose location is implicit from cross-
+	// stage linkage). Without this widening, Option A1's name-based
+	// dedupe iterates over an inputs_by_location map that doesn't
+	// contain the natural entry, dedupe doesn't fire, synthetic-range
+	// duplicates survive into main0_in. Option E.2 gathers names from
+	// ALL natural Input variables for Pass 3's dedupe; Pass 2 still
+	// gates on Location decoration (un-decorated entries can't form
+	// a valid map key, so they don't get populated into
+	// inputs_by_location — only name-tracked for dedupe).
+	//
+	// Skips builtins (handled separately by inputs_by_builtin) and
+	// synthetic-range entries (those would already be in
+	// inputs_by_location via add_msl_shader_input).
+	std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> natural_with_loc;
+	std::unordered_set<std::string> natural_names;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		if (var.storage != StorageClassInput)
+			return;
+		if (is_builtin_variable(var))
+			return;
+		const std::string &name = get_name(var.self);
+		if (name.empty())
+			return;
+
+		// Path J' Option E.2: capture name regardless of Location
+		// decoration form. Pass 2's map population still requires
+		// Location for a valid key.
+		if (has_decoration(var.self, DecorationLocation))
+		{
+			uint32_t loc = get_decoration(var.self, DecorationLocation);
+			if (loc >= synthetic_loc_threshold)
+				return;
+			uint32_t comp = has_decoration(var.self, DecorationComponent)
+			                ? get_decoration(var.self, DecorationComponent)
+			                : 0u;
+			natural_with_loc[name] = std::make_pair(loc, comp);
+		}
+		natural_names.insert(name);
+	});
+
+	// Pass 2: populate inputs_by_location with natural entries that
+	// have Location decoration (only if absent — preserves
+	// API-registered entries that may contain richer information from
+	// add_msl_shader_input calls). Un-decorated entries are NOT
+	// populated here — they have no valid map key — but Pass 3 still
+	// dedupes synthetic-range duplicates against their names.
+	for (auto &nm : natural_with_loc)
+	{
+		LocationComponentPair key = { nm.second.first, nm.second.second };
+		if (inputs_by_location.count(key))
+			continue;
+		MSLShaderInterfaceVariable v;
+		v.name = nm.first;
+		v.location = nm.second.first;
+		v.component = nm.second.second;
+		v.format = MSL_SHADER_VARIABLE_FORMAT_ANY32;
+		v.builtin = BuiltInMax;
+		v.vecsize = 0;
+		v.rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+		inputs_by_location[key] = v;
+	}
+
+	// Pass 3: dedupe synthetic-range entries whose names match ANY
+	// natural entry (with or without Location decoration). Path J'
+	// Option E.2 widens this to handle monolithic-program TES — the
+	// natural-name set covers entries that Option E's narrower
+	// natural_name_to_loc would have missed.
+	for (auto it = inputs_by_location.begin(); it != inputs_by_location.end();)
+	{
+		if (it->first.location >= synthetic_loc_threshold &&
+		    !it->second.name.empty() &&
+		    natural_names.count(it->second.name))
+			it = inputs_by_location.erase(it);
+		else
+			++it;
+	}
+}
+
+// Phase 2.5 Gap A: synthesize a gl_Position Output variable for
+// GS-as-mesh shaders that don't write one.
+//
+// Apple Metal's mesh shader vertex output type must declare a member
+// with the `[[position]]` attribute. GLSL geometry shaders that omit
+// `gl_Position = ...` (TF-only / depth-only patterns, e.g. lines_adj
+// in / line_strip out exporting only user varyings) compile cleanly per
+// GL spec — gl_Position default is undefined when not written; rasterizer
+// reads garbage but the program is still well-formed. Mesh-pipeline
+// emission rejects this with `error: invalid type 'spvPerVertex' for
+// mesh vertex type / missing mesh output declaration with attribute
+// 'position'`.
+//
+// Fix: synthesize a vec4 OpVariable with `Output` storage class and
+// `BuiltIn Position` decoration in the IR before add_meshlet_block
+// runs. The existing meshlet-block builder picks it up via the
+// for_each_typed_id walk and adds it to spvPerVertex (with the
+// `[[position]]` attribute) automatically. The body never references
+// or writes the synthesized variable; the function-local
+// `spvVertices = {}` zero-init carries (0,0,0,0) through to
+// `spvMesh.set_vertex` at function exit.
+//
+// Uniform mirrors the gl_FragCoord synthesis pattern at line 681 area —
+// allocate type IDs via `ir.increase_bound_by`, set SPIRType + pointer
+// SPIRType, set SPIRVariable, decorate. Mark as implicit-builtin so
+// downstream passes (active-builtin tracking, etc.) recognize it.
+void CompilerMSL::ensure_gs_as_mesh_position_output()
+{
+	if (!is_mesh_shader() || get_execution_model() != ExecutionModelGeometry)
+		return;
+	if (!msl_options.geometry_shader_as_mesh)
+		return;
+
+	// Search Output vars for an existing BuiltIn Position. If present,
+	// nothing to synthesize. Position can appear two ways:
+	//   1. Top-level Output variable with `BuiltIn Position` decoration —
+	//      rare; usually only when GS author declared `out vec4 gl_Position`
+	//      explicitly without the gl_PerVertex block.
+	//   2. Member of a gl_PerVertex Output block (the typical GLSL form
+	//      `gl_Position = ...;`) where Position is a member-level builtin
+	//      decoration on the block struct, not on the variable itself.
+	bool has_position = false;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		if (var.storage != StorageClassOutput)
+			return;
+		if (has_decoration(var.self, DecorationBuiltIn) &&
+		    BuiltIn(get_decoration(var.self, DecorationBuiltIn)) == BuiltInPosition)
+		{
+			has_position = true;
+			return;
+		}
+		// Walk the variable's data type for builtin Position members.
+		const auto &data_type = get_variable_data_type(var);
+		// gl_PerVertex output is typically NOT array-typed (in mesh
+		// emission context the array is per-vertex iteration handled
+		// by spvVertices); a non-array struct or struct-pointer suffices.
+		const SPIRType *struct_type = &data_type;
+		if (!data_type.array.empty())
+			struct_type = &get<SPIRType>(data_type.parent_type);
+		if (struct_type->basetype != SPIRType::Struct)
+			return;
+		for (uint32_t i = 0; i < uint32_t(struct_type->member_types.size()); ++i)
+		{
+			if (has_member_decoration(struct_type->self, i, DecorationBuiltIn) &&
+			    BuiltIn(get_member_decoration(struct_type->self, i, DecorationBuiltIn)) ==
+			        BuiltInPosition)
+			{
+				has_position = true;
+				return;
+			}
+		}
+	});
+	if (has_position)
+		return;
+
+	// Synthesize the gl_Position output. Allocate 3 IDs: vec4 type,
+	// pointer-to-vec4 type, variable.
+	uint32_t offset = ir.increase_bound_by(3);
+	uint32_t type_id = offset;
+	uint32_t type_ptr_id = offset + 1;
+	uint32_t var_id = offset + 2;
+
+	SPIRType vec4_type { OpTypeVector };
+	vec4_type.basetype = SPIRType::Float;
+	vec4_type.width = 32;
+	vec4_type.vecsize = 4;
+	set<SPIRType>(type_id, vec4_type);
+
+	SPIRType vec4_type_ptr = vec4_type;
+	vec4_type_ptr.op = OpTypePointer;
+	vec4_type_ptr.pointer = true;
+	vec4_type_ptr.pointer_depth++;
+	vec4_type_ptr.parent_type = type_id;
+	vec4_type_ptr.storage = StorageClassOutput;
+	auto &ptr_type = set<SPIRType>(type_ptr_id, vec4_type_ptr);
+	ptr_type.self = type_id;
+
+	set<SPIRVariable>(var_id, type_ptr_id, StorageClassOutput);
+	set_decoration(var_id, DecorationBuiltIn, BuiltInPosition);
+	set_name(var_id, "gl_Position");
+	mark_implicit_builtin(StorageClassOutput, BuiltInPosition, var_id);
 }
 
 // Ensure that the type is compatible with the builtin.
@@ -5747,6 +6641,588 @@ string CompilerMSL::unpack_expression_type(string expr_str, const SPIRType &type
 	}
 }
 
+bool CompilerMSL::appgl_fp64_emulation_enabled_for_type(const SPIRType &type) const
+{
+	return msl_options.appgl_fp64_emulation && type.basetype == SPIRType::Double;
+}
+
+bool CompilerMSL::appgl_fp64_emulation_enabled_for_type_id(uint32_t type_id) const
+{
+	return type_id && appgl_fp64_emulation_enabled_for_type(get<SPIRType>(type_id));
+}
+
+bool CompilerMSL::appgl_fp64_module_uses_emulation() const
+{
+	if (!msl_options.appgl_fp64_emulation)
+		return false;
+
+	bool uses_fp64 = false;
+	ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &type) {
+		if (type.basetype == SPIRType::Double)
+			uses_fp64 = true;
+	});
+	return uses_fp64;
+}
+
+string CompilerMSL::appgl_fp64_msl_type_name(const SPIRType &type) const
+{
+	if (type.columns > 1)
+		return join("appgl_df64mat", type.columns, "x", type.vecsize);
+	else if (type.vecsize > 1)
+		return join("appgl_df64x", type.vecsize);
+	else
+		return "appgl_df64";
+}
+
+string CompilerMSL::appgl_fp64_float_literal(float value) const
+{
+	auto literal = format_float(value);
+	literal += "f";
+	return literal;
+}
+
+string CompilerMSL::appgl_fp64_constant_component(const SPIRConstant &c, uint32_t col, uint32_t row)
+{
+	double value = c.scalar_f64(col, row);
+	if (std::isnan(value))
+		return "appgl_df64_from_dd(float2(0.0f / 0.0f, 0.0f))";
+	else if (value == std::numeric_limits<double>::infinity())
+		return "appgl_df64_from_dd(float2(1.0f / 0.0f, 0.0f))";
+	else if (value == -std::numeric_limits<double>::infinity())
+		return "appgl_df64_from_dd(float2(-1.0f / 0.0f, 0.0f))";
+
+	float hi = static_cast<float>(value);
+	float lo = static_cast<float>(value - static_cast<double>(hi));
+	return join("appgl_df64_from_dd(float2(", appgl_fp64_float_literal(hi), ", ",
+	            appgl_fp64_float_literal(lo), "))");
+}
+
+void CompilerMSL::emit_appgl_fp64_emulation_helpers()
+{
+	static const char *lines[] = {
+		"struct appgl_df64 {",
+		"    alignas(8) uint2 words;",
+		"    appgl_df64() = default;",
+		"    explicit appgl_df64(uint2 w) : words(w) {}",
+		"};",
+		"",
+		"struct appgl_df64x2 {",
+		"    alignas(16) appgl_df64 x;",
+		"    appgl_df64 y;",
+		"    appgl_df64x2() = default;",
+		"    appgl_df64x2(appgl_df64 a, appgl_df64 b) : x(a), y(b) {}",
+		"};",
+		"",
+		"struct appgl_df64x3 {",
+		"    alignas(32) appgl_df64 x;",
+		"    appgl_df64 y;",
+		"    appgl_df64 z;",
+		"    appgl_df64 _pad;",
+		"    appgl_df64x3() = default;",
+		"    appgl_df64x3(appgl_df64 a, appgl_df64 b, appgl_df64 c) : x(a), y(b), z(c) {}",
+		"};",
+		"",
+		"struct appgl_df64x4 {",
+		"    alignas(32) appgl_df64 x;",
+		"    appgl_df64 y;",
+		"    appgl_df64 z;",
+		"    appgl_df64 w;",
+		"    appgl_df64x4() = default;",
+		"    appgl_df64x4(appgl_df64 a, appgl_df64 b, appgl_df64 c, appgl_df64 d) : x(a), y(b), z(c), w(d) {}",
+		"};",
+		"",
+		"struct appgl_df64mat2x2 {",
+		"    appgl_df64x2 c0;",
+			"    appgl_df64x2 c1;",
+			"    appgl_df64mat2x2() = default;",
+			"    appgl_df64mat2x2(appgl_df64x2 a, appgl_df64x2 b) : c0(a), c1(b) {}",
+			"    thread appgl_df64x2& operator[](size_t idx) thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x2 operator[](size_t idx) const thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x2 operator[](size_t idx) const constant { return idx == 0 ? c0 : c1; }",
+			"};",
+		"",
+		"struct appgl_df64mat3x3 {",
+		"    appgl_df64x3 c0;",
+		"    appgl_df64x3 c1;",
+			"    appgl_df64x3 c2;",
+			"    appgl_df64mat3x3() = default;",
+			"    appgl_df64mat3x3(appgl_df64x3 a, appgl_df64x3 b, appgl_df64x3 c) : c0(a), c1(b), c2(c) {}",
+			"    thread appgl_df64x3& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x3 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x3 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"};",
+		"",
+		"struct appgl_df64mat4x4 {",
+		"    appgl_df64x4 c0;",
+		"    appgl_df64x4 c1;",
+		"    appgl_df64x4 c2;",
+			"    appgl_df64x4 c3;",
+			"    appgl_df64mat4x4() = default;",
+			"    appgl_df64mat4x4(appgl_df64x4 a, appgl_df64x4 b, appgl_df64x4 c, appgl_df64x4 d) : c0(a), c1(b), c2(c), c3(d) {}",
+			"    thread appgl_df64x4& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x4 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x4 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"};",
+		"",
+		"struct appgl_df64mat2x3 {",
+		"    appgl_df64x3 c0;",
+			"    appgl_df64x3 c1;",
+			"    appgl_df64mat2x3() = default;",
+			"    appgl_df64mat2x3(appgl_df64x3 a0, appgl_df64x3 a1) : c0(a0), c1(a1) {}",
+			"    thread appgl_df64x3& operator[](size_t idx) thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x3 operator[](size_t idx) const thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x3 operator[](size_t idx) const constant { return idx == 0 ? c0 : c1; }",
+			"};",
+		"",
+		"struct appgl_df64mat2x4 {",
+		"    appgl_df64x4 c0;",
+			"    appgl_df64x4 c1;",
+			"    appgl_df64mat2x4() = default;",
+			"    appgl_df64mat2x4(appgl_df64x4 a0, appgl_df64x4 a1) : c0(a0), c1(a1) {}",
+			"    thread appgl_df64x4& operator[](size_t idx) thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x4 operator[](size_t idx) const thread { return idx == 0 ? c0 : c1; }",
+			"    appgl_df64x4 operator[](size_t idx) const constant { return idx == 0 ? c0 : c1; }",
+			"};",
+		"",
+		"struct appgl_df64mat3x2 {",
+		"    appgl_df64x2 c0;",
+		"    appgl_df64x2 c1;",
+			"    appgl_df64x2 c2;",
+			"    appgl_df64mat3x2() = default;",
+			"    appgl_df64mat3x2(appgl_df64x2 a0, appgl_df64x2 a1, appgl_df64x2 a2) : c0(a0), c1(a1), c2(a2) {}",
+			"    thread appgl_df64x2& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x2 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x2 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"};",
+		"",
+		"struct appgl_df64mat3x4 {",
+		"    appgl_df64x4 c0;",
+		"    appgl_df64x4 c1;",
+			"    appgl_df64x4 c2;",
+			"    appgl_df64mat3x4() = default;",
+			"    appgl_df64mat3x4(appgl_df64x4 a0, appgl_df64x4 a1, appgl_df64x4 a2) : c0(a0), c1(a1), c2(a2) {}",
+			"    thread appgl_df64x4& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x4 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"    appgl_df64x4 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : c2); }",
+			"};",
+		"",
+		"struct appgl_df64mat4x2 {",
+		"    appgl_df64x2 c0;",
+		"    appgl_df64x2 c1;",
+		"    appgl_df64x2 c2;",
+			"    appgl_df64x2 c3;",
+			"    appgl_df64mat4x2() = default;",
+			"    appgl_df64mat4x2(appgl_df64x2 a0, appgl_df64x2 a1, appgl_df64x2 a2, appgl_df64x2 a3) : c0(a0), c1(a1), c2(a2), c3(a3) {}",
+			"    thread appgl_df64x2& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x2 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x2 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"};",
+		"",
+		"struct appgl_df64mat4x3 {",
+		"    appgl_df64x3 c0;",
+		"    appgl_df64x3 c1;",
+		"    appgl_df64x3 c2;",
+			"    appgl_df64x3 c3;",
+			"    appgl_df64mat4x3() = default;",
+			"    appgl_df64mat4x3(appgl_df64x3 a0, appgl_df64x3 a1, appgl_df64x3 a2, appgl_df64x3 a3) : c0(a0), c1(a1), c2(a2), c3(a3) {}",
+			"    thread appgl_df64x3& operator[](size_t idx) thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x3 operator[](size_t idx) const thread { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"    appgl_df64x3 operator[](size_t idx) const constant { return idx == 0 ? c0 : (idx == 1 ? c1 : (idx == 2 ? c2 : c3)); }",
+			"};",
+		"",
+		"inline appgl_df64 appgl_df64_from_words(uint lo, uint hi)",
+		"{",
+		"    return appgl_df64(uint2(lo, hi));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_from_words2(uint2 words)",
+		"{",
+		"    return appgl_df64(words);",
+		"}",
+		"",
+		"inline uint2 appgl_df64_words(appgl_df64 value)",
+		"{",
+		"    return value.words;",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_from_dd(float2 value)",
+		"{",
+		"    return appgl_df64(as_type<uint2>(value));",
+		"}",
+		"",
+		"inline float2 appgl_df64_to_dd(appgl_df64 value)",
+		"{",
+		"    return as_type<float2>(value.words);",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_from_float(float value)",
+		"{",
+		"    return appgl_df64_from_dd(float2(value, 0.0f));",
+		"}",
+		"",
+		"inline appgl_df64x2 appgl_df64_from_float(float2 value)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_from_float(value.x), appgl_df64_from_float(value.y));",
+		"}",
+		"",
+		"inline appgl_df64x3 appgl_df64_from_float(float3 value)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_from_float(value.x), appgl_df64_from_float(value.y), appgl_df64_from_float(value.z));",
+		"}",
+		"",
+		"inline appgl_df64x4 appgl_df64_from_float(float4 value)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_from_float(value.x), appgl_df64_from_float(value.y), appgl_df64_from_float(value.z), appgl_df64_from_float(value.w));",
+		"}",
+		"",
+		"inline float appgl_df64_to_float(appgl_df64 value)",
+		"{",
+		"    const float2 v = appgl_df64_to_dd(value);",
+		"    return v.x + v.y;",
+		"}",
+		"",
+		"inline float2 appgl_df64_to_float(appgl_df64x2 value)",
+		"{",
+		"    return float2(appgl_df64_to_float(value.x), appgl_df64_to_float(value.y));",
+		"}",
+		"",
+		"inline float3 appgl_df64_to_float(appgl_df64x3 value)",
+		"{",
+		"    return float3(appgl_df64_to_float(value.x), appgl_df64_to_float(value.y), appgl_df64_to_float(value.z));",
+		"}",
+		"",
+		"inline float4 appgl_df64_to_float(appgl_df64x4 value)",
+		"{",
+		"    return float4(appgl_df64_to_float(value.x), appgl_df64_to_float(value.y), appgl_df64_to_float(value.z), appgl_df64_to_float(value.w));",
+		"}",
+		"",
+		"inline float2 appgl_dd_quick_two_sum(float a, float b)",
+		"{",
+		"    const float s = a + b;",
+		"    const float e = b - (s - a);",
+		"    return float2(s, e);",
+		"}",
+		"",
+		"inline float2 appgl_dd_two_sum(float a, float b)",
+		"{",
+		"    const float s = a + b;",
+		"    const float bb = s - a;",
+		"    const float e = (a - (s - bb)) + (b - bb);",
+		"    return float2(s, e);",
+		"}",
+		"",
+		"inline float2 appgl_dd_two_prod(float a, float b)",
+		"{",
+		"    const float p = a * b;",
+		"    const float e = fma(a, b, -p);",
+		"    return float2(p, e);",
+		"}",
+		"",
+		"inline float2 appgl_dd_add(float2 a, float2 b)",
+		"{",
+		"    const float2 s = appgl_dd_two_sum(a.x, b.x);",
+		"    const float e = s.y + a.y + b.y;",
+		"    return appgl_dd_quick_two_sum(s.x, e);",
+		"}",
+		"",
+		"inline float2 appgl_dd_sub(float2 a, float2 b)",
+		"{",
+		"    return appgl_dd_add(a, float2(-b.x, -b.y));",
+		"}",
+		"",
+		"inline float2 appgl_dd_mul(float2 a, float2 b)",
+		"{",
+		"    const float2 p = appgl_dd_two_prod(a.x, b.x);",
+		"    const float e = p.y + (a.x * b.y) + (a.y * b.x);",
+		"    return appgl_dd_quick_two_sum(p.x, e);",
+		"}",
+		"",
+		"inline float2 appgl_dd_div(float2 a, float2 b)",
+		"{",
+		"    const float q1 = a.x / b.x;",
+		"    const float2 r = appgl_dd_sub(a, appgl_dd_mul(float2(q1, 0.0f), b));",
+		"    const float q2 = r.x / b.x;",
+		"    return appgl_dd_add(float2(q1, 0.0f), float2(q2, 0.0f));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_neg(appgl_df64 value)",
+		"{",
+		"    const float2 v = appgl_df64_to_dd(value);",
+		"    return appgl_df64_from_dd(float2(-v.x, -v.y));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_add(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    return appgl_df64_from_dd(appgl_dd_add(appgl_df64_to_dd(a), appgl_df64_to_dd(b)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_sub(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    return appgl_df64_from_dd(appgl_dd_sub(appgl_df64_to_dd(a), appgl_df64_to_dd(b)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_mul(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    return appgl_df64_from_dd(appgl_dd_mul(appgl_df64_to_dd(a), appgl_df64_to_dd(b)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_div(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    return appgl_df64_from_dd(appgl_dd_div(appgl_df64_to_dd(a), appgl_df64_to_dd(b)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_sqrt(appgl_df64 value)",
+		"{",
+		"    return appgl_df64_from_float(sqrt(max(appgl_df64_to_float(value), 0.0f)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_abs(appgl_df64 value)",
+		"{",
+		"    return appgl_df64_to_float(value) < 0.0f ? appgl_df64_neg(value) : value;",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_floor(appgl_df64 value) { return appgl_df64_from_float(floor(appgl_df64_to_float(value))); }",
+		"inline appgl_df64 appgl_df64_ceil(appgl_df64 value) { return appgl_df64_from_float(ceil(appgl_df64_to_float(value))); }",
+		"inline appgl_df64 appgl_df64_round(appgl_df64 value) { return appgl_df64_from_float(round(appgl_df64_to_float(value))); }",
+		"inline appgl_df64 appgl_df64_trunc(appgl_df64 value) { return appgl_df64_from_float(trunc(appgl_df64_to_float(value))); }",
+		"inline appgl_df64 appgl_df64_sign(appgl_df64 value)",
+		"{",
+		"    const float v = appgl_df64_to_float(value);",
+		"    return appgl_df64_from_float((v > 0.0f ? 1.0f : 0.0f) - (v < 0.0f ? 1.0f : 0.0f));",
+		"}",
+		"",
+		"inline bool appgl_df64_eq(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    const float2 av = appgl_df64_to_dd(a);",
+		"    const float2 bv = appgl_df64_to_dd(b);",
+		"    return av.x == bv.x && av.y == bv.y;",
+		"}",
+		"",
+		"inline bool appgl_df64_lt(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    const float2 av = appgl_df64_to_dd(a);",
+		"    const float2 bv = appgl_df64_to_dd(b);",
+		"    return av.x < bv.x || (av.x == bv.x && av.y < bv.y);",
+		"}",
+		"",
+		"inline bool appgl_df64_gt(appgl_df64 a, appgl_df64 b) { return appgl_df64_lt(b, a); }",
+		"inline bool appgl_df64_ne(appgl_df64 a, appgl_df64 b) { return !appgl_df64_eq(a, b); }",
+		"inline bool appgl_df64_le(appgl_df64 a, appgl_df64 b) { return !appgl_df64_gt(a, b); }",
+		"inline bool appgl_df64_ge(appgl_df64 a, appgl_df64 b) { return !appgl_df64_lt(a, b); }",
+		"inline bool appgl_df64_unord(appgl_df64 a, appgl_df64 b)",
+		"{",
+		"    const float2 av = appgl_df64_to_dd(a);",
+		"    const float2 bv = appgl_df64_to_dd(b);",
+		"    return isnan(av.x) || isnan(av.y) || isnan(bv.x) || isnan(bv.y);",
+		"}",
+		"inline bool appgl_df64_ueq(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_eq(a, b); }",
+		"inline bool appgl_df64_une(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_ne(a, b); }",
+		"inline bool appgl_df64_ult(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_lt(a, b); }",
+		"inline bool appgl_df64_ugt(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_gt(a, b); }",
+		"inline bool appgl_df64_ule(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_le(a, b); }",
+		"inline bool appgl_df64_uge(appgl_df64 a, appgl_df64 b) { return appgl_df64_unord(a, b) || appgl_df64_ge(a, b); }",
+		"",
+		"inline appgl_df64 appgl_df64_min(appgl_df64 a, appgl_df64 b) { return appgl_df64_lt(b, a) ? b : a; }",
+		"inline appgl_df64 appgl_df64_max(appgl_df64 a, appgl_df64 b) { return appgl_df64_lt(a, b) ? b : a; }",
+		"inline appgl_df64 appgl_df64_clamp(appgl_df64 v, appgl_df64 lo, appgl_df64 hi) { return appgl_df64_min(appgl_df64_max(v, lo), hi); }",
+		"inline appgl_df64 appgl_df64_mix(appgl_df64 a, appgl_df64 b, appgl_df64 t) { return appgl_df64_add(a, appgl_df64_mul(appgl_df64_sub(b, a), t)); }",
+		"inline appgl_df64 appgl_df64_madd(appgl_df64 a, appgl_df64 b, appgl_df64 c) { return appgl_df64_add(appgl_df64_mul(a, b), c); }",
+		"",
+		"inline appgl_df64x2 appgl_df64_neg(appgl_df64x2 v) { return appgl_df64x2(appgl_df64_neg(v.x), appgl_df64_neg(v.y)); }",
+		"inline appgl_df64x3 appgl_df64_neg(appgl_df64x3 v) { return appgl_df64x3(appgl_df64_neg(v.x), appgl_df64_neg(v.y), appgl_df64_neg(v.z)); }",
+		"inline appgl_df64x4 appgl_df64_neg(appgl_df64x4 v) { return appgl_df64x4(appgl_df64_neg(v.x), appgl_df64_neg(v.y), appgl_df64_neg(v.z), appgl_df64_neg(v.w)); }",
+		"inline appgl_df64x2 appgl_df64_add(appgl_df64x2 a, appgl_df64x2 b) { return appgl_df64x2(appgl_df64_add(a.x, b.x), appgl_df64_add(a.y, b.y)); }",
+		"inline appgl_df64x3 appgl_df64_add(appgl_df64x3 a, appgl_df64x3 b) { return appgl_df64x3(appgl_df64_add(a.x, b.x), appgl_df64_add(a.y, b.y), appgl_df64_add(a.z, b.z)); }",
+		"inline appgl_df64x4 appgl_df64_add(appgl_df64x4 a, appgl_df64x4 b) { return appgl_df64x4(appgl_df64_add(a.x, b.x), appgl_df64_add(a.y, b.y), appgl_df64_add(a.z, b.z), appgl_df64_add(a.w, b.w)); }",
+		"inline appgl_df64x2 appgl_df64_sub(appgl_df64x2 a, appgl_df64x2 b) { return appgl_df64x2(appgl_df64_sub(a.x, b.x), appgl_df64_sub(a.y, b.y)); }",
+		"inline appgl_df64x3 appgl_df64_sub(appgl_df64x3 a, appgl_df64x3 b) { return appgl_df64x3(appgl_df64_sub(a.x, b.x), appgl_df64_sub(a.y, b.y), appgl_df64_sub(a.z, b.z)); }",
+		"inline appgl_df64x4 appgl_df64_sub(appgl_df64x4 a, appgl_df64x4 b) { return appgl_df64x4(appgl_df64_sub(a.x, b.x), appgl_df64_sub(a.y, b.y), appgl_df64_sub(a.z, b.z), appgl_df64_sub(a.w, b.w)); }",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64x2 a, appgl_df64x2 b) { return appgl_df64x2(appgl_df64_mul(a.x, b.x), appgl_df64_mul(a.y, b.y)); }",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64x3 a, appgl_df64x3 b) { return appgl_df64x3(appgl_df64_mul(a.x, b.x), appgl_df64_mul(a.y, b.y), appgl_df64_mul(a.z, b.z)); }",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64x4 a, appgl_df64x4 b) { return appgl_df64x4(appgl_df64_mul(a.x, b.x), appgl_df64_mul(a.y, b.y), appgl_df64_mul(a.z, b.z), appgl_df64_mul(a.w, b.w)); }",
+		"inline appgl_df64x2 appgl_df64_div(appgl_df64x2 a, appgl_df64x2 b) { return appgl_df64x2(appgl_df64_div(a.x, b.x), appgl_df64_div(a.y, b.y)); }",
+		"inline appgl_df64x3 appgl_df64_div(appgl_df64x3 a, appgl_df64x3 b) { return appgl_df64x3(appgl_df64_div(a.x, b.x), appgl_df64_div(a.y, b.y), appgl_df64_div(a.z, b.z)); }",
+		"inline appgl_df64x4 appgl_df64_div(appgl_df64x4 a, appgl_df64x4 b) { return appgl_df64x4(appgl_df64_div(a.x, b.x), appgl_df64_div(a.y, b.y), appgl_df64_div(a.z, b.z), appgl_df64_div(a.w, b.w)); }",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64x2 a, appgl_df64 b) { return appgl_df64x2(appgl_df64_mul(a.x, b), appgl_df64_mul(a.y, b)); }",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64x3 a, appgl_df64 b) { return appgl_df64x3(appgl_df64_mul(a.x, b), appgl_df64_mul(a.y, b), appgl_df64_mul(a.z, b)); }",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64x4 a, appgl_df64 b) { return appgl_df64x4(appgl_df64_mul(a.x, b), appgl_df64_mul(a.y, b), appgl_df64_mul(a.z, b), appgl_df64_mul(a.w, b)); }",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64 a, appgl_df64x2 b) { return appgl_df64_mul(b, a); }",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64 a, appgl_df64x3 b) { return appgl_df64_mul(b, a); }",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64 a, appgl_df64x4 b) { return appgl_df64_mul(b, a); }",
+		"inline appgl_df64x2 appgl_df64_sqrt(appgl_df64x2 v) { return appgl_df64x2(appgl_df64_sqrt(v.x), appgl_df64_sqrt(v.y)); }",
+		"inline appgl_df64x3 appgl_df64_sqrt(appgl_df64x3 v) { return appgl_df64x3(appgl_df64_sqrt(v.x), appgl_df64_sqrt(v.y), appgl_df64_sqrt(v.z)); }",
+		"inline appgl_df64x4 appgl_df64_sqrt(appgl_df64x4 v) { return appgl_df64x4(appgl_df64_sqrt(v.x), appgl_df64_sqrt(v.y), appgl_df64_sqrt(v.z), appgl_df64_sqrt(v.w)); }",
+		"inline appgl_df64x2 appgl_df64_abs(appgl_df64x2 v) { return appgl_df64x2(appgl_df64_abs(v.x), appgl_df64_abs(v.y)); }",
+		"inline appgl_df64x3 appgl_df64_abs(appgl_df64x3 v) { return appgl_df64x3(appgl_df64_abs(v.x), appgl_df64_abs(v.y), appgl_df64_abs(v.z)); }",
+		"inline appgl_df64x4 appgl_df64_abs(appgl_df64x4 v) { return appgl_df64x4(appgl_df64_abs(v.x), appgl_df64_abs(v.y), appgl_df64_abs(v.z), appgl_df64_abs(v.w)); }",
+		"inline bool2 appgl_df64_eq(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_eq(a.x, b.x), appgl_df64_eq(a.y, b.y)); }",
+		"inline bool3 appgl_df64_eq(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_eq(a.x, b.x), appgl_df64_eq(a.y, b.y), appgl_df64_eq(a.z, b.z)); }",
+		"inline bool4 appgl_df64_eq(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_eq(a.x, b.x), appgl_df64_eq(a.y, b.y), appgl_df64_eq(a.z, b.z), appgl_df64_eq(a.w, b.w)); }",
+		"inline bool2 appgl_df64_lt(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_lt(a.x, b.x), appgl_df64_lt(a.y, b.y)); }",
+		"inline bool3 appgl_df64_lt(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_lt(a.x, b.x), appgl_df64_lt(a.y, b.y), appgl_df64_lt(a.z, b.z)); }",
+		"inline bool4 appgl_df64_lt(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_lt(a.x, b.x), appgl_df64_lt(a.y, b.y), appgl_df64_lt(a.z, b.z), appgl_df64_lt(a.w, b.w)); }",
+		"inline bool2 appgl_df64_gt(appgl_df64x2 a, appgl_df64x2 b) { return appgl_df64_lt(b, a); }",
+		"inline bool3 appgl_df64_gt(appgl_df64x3 a, appgl_df64x3 b) { return appgl_df64_lt(b, a); }",
+		"inline bool4 appgl_df64_gt(appgl_df64x4 a, appgl_df64x4 b) { return appgl_df64_lt(b, a); }",
+		"inline bool2 appgl_df64_ne(appgl_df64x2 a, appgl_df64x2 b) { return !appgl_df64_eq(a, b); }",
+		"inline bool3 appgl_df64_ne(appgl_df64x3 a, appgl_df64x3 b) { return !appgl_df64_eq(a, b); }",
+		"inline bool4 appgl_df64_ne(appgl_df64x4 a, appgl_df64x4 b) { return !appgl_df64_eq(a, b); }",
+		"inline bool2 appgl_df64_le(appgl_df64x2 a, appgl_df64x2 b) { return !appgl_df64_gt(a, b); }",
+		"inline bool3 appgl_df64_le(appgl_df64x3 a, appgl_df64x3 b) { return !appgl_df64_gt(a, b); }",
+		"inline bool4 appgl_df64_le(appgl_df64x4 a, appgl_df64x4 b) { return !appgl_df64_gt(a, b); }",
+		"inline bool2 appgl_df64_ge(appgl_df64x2 a, appgl_df64x2 b) { return !appgl_df64_lt(a, b); }",
+		"inline bool3 appgl_df64_ge(appgl_df64x3 a, appgl_df64x3 b) { return !appgl_df64_lt(a, b); }",
+		"inline bool4 appgl_df64_ge(appgl_df64x4 a, appgl_df64x4 b) { return !appgl_df64_lt(a, b); }",
+		"inline bool2 appgl_df64_unord(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_unord(a.x, b.x), appgl_df64_unord(a.y, b.y)); }",
+		"inline bool3 appgl_df64_unord(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_unord(a.x, b.x), appgl_df64_unord(a.y, b.y), appgl_df64_unord(a.z, b.z)); }",
+		"inline bool4 appgl_df64_unord(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_unord(a.x, b.x), appgl_df64_unord(a.y, b.y), appgl_df64_unord(a.z, b.z), appgl_df64_unord(a.w, b.w)); }",
+		"inline bool2 appgl_df64_ueq(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_ueq(a.x, b.x), appgl_df64_ueq(a.y, b.y)); }",
+		"inline bool3 appgl_df64_ueq(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_ueq(a.x, b.x), appgl_df64_ueq(a.y, b.y), appgl_df64_ueq(a.z, b.z)); }",
+		"inline bool4 appgl_df64_ueq(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_ueq(a.x, b.x), appgl_df64_ueq(a.y, b.y), appgl_df64_ueq(a.z, b.z), appgl_df64_ueq(a.w, b.w)); }",
+		"inline bool2 appgl_df64_une(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_une(a.x, b.x), appgl_df64_une(a.y, b.y)); }",
+		"inline bool3 appgl_df64_une(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_une(a.x, b.x), appgl_df64_une(a.y, b.y), appgl_df64_une(a.z, b.z)); }",
+		"inline bool4 appgl_df64_une(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_une(a.x, b.x), appgl_df64_une(a.y, b.y), appgl_df64_une(a.z, b.z), appgl_df64_une(a.w, b.w)); }",
+		"inline bool2 appgl_df64_ult(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_ult(a.x, b.x), appgl_df64_ult(a.y, b.y)); }",
+		"inline bool3 appgl_df64_ult(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_ult(a.x, b.x), appgl_df64_ult(a.y, b.y), appgl_df64_ult(a.z, b.z)); }",
+		"inline bool4 appgl_df64_ult(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_ult(a.x, b.x), appgl_df64_ult(a.y, b.y), appgl_df64_ult(a.z, b.z), appgl_df64_ult(a.w, b.w)); }",
+		"inline bool2 appgl_df64_ugt(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_ugt(a.x, b.x), appgl_df64_ugt(a.y, b.y)); }",
+		"inline bool3 appgl_df64_ugt(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_ugt(a.x, b.x), appgl_df64_ugt(a.y, b.y), appgl_df64_ugt(a.z, b.z)); }",
+		"inline bool4 appgl_df64_ugt(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_ugt(a.x, b.x), appgl_df64_ugt(a.y, b.y), appgl_df64_ugt(a.z, b.z), appgl_df64_ugt(a.w, b.w)); }",
+		"inline bool2 appgl_df64_ule(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_ule(a.x, b.x), appgl_df64_ule(a.y, b.y)); }",
+		"inline bool3 appgl_df64_ule(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_ule(a.x, b.x), appgl_df64_ule(a.y, b.y), appgl_df64_ule(a.z, b.z)); }",
+		"inline bool4 appgl_df64_ule(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_ule(a.x, b.x), appgl_df64_ule(a.y, b.y), appgl_df64_ule(a.z, b.z), appgl_df64_ule(a.w, b.w)); }",
+		"inline bool2 appgl_df64_uge(appgl_df64x2 a, appgl_df64x2 b) { return bool2(appgl_df64_uge(a.x, b.x), appgl_df64_uge(a.y, b.y)); }",
+		"inline bool3 appgl_df64_uge(appgl_df64x3 a, appgl_df64x3 b) { return bool3(appgl_df64_uge(a.x, b.x), appgl_df64_uge(a.y, b.y), appgl_df64_uge(a.z, b.z)); }",
+		"inline bool4 appgl_df64_uge(appgl_df64x4 a, appgl_df64x4 b) { return bool4(appgl_df64_uge(a.x, b.x), appgl_df64_uge(a.y, b.y), appgl_df64_uge(a.z, b.z), appgl_df64_uge(a.w, b.w)); }",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64mat2x2 m, appgl_df64x2 v)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_madd(m.c0.x, v.x, appgl_df64_mul(m.c1.x, v.y)),",
+		"                        appgl_df64_madd(m.c0.y, v.x, appgl_df64_mul(m.c1.y, v.y)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64mat3x3 m, appgl_df64x3 v)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_madd(m.c0.x, v.x, appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)),",
+		"                        appgl_df64_add(appgl_df64_madd(m.c0.y, v.x, appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)),",
+		"                        appgl_df64_add(appgl_df64_madd(m.c0.z, v.x, appgl_df64_mul(m.c1.z, v.y)), appgl_df64_mul(m.c2.z, v.z)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64mat4x4 m, appgl_df64x4 v)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_add(appgl_df64_madd(m.c0.x, v.x, appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)), appgl_df64_mul(m.c3.x, v.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(m.c0.y, v.x, appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)), appgl_df64_mul(m.c3.y, v.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(m.c0.z, v.x, appgl_df64_mul(m.c1.z, v.y)), appgl_df64_mul(m.c2.z, v.z)), appgl_df64_mul(m.c3.z, v.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(m.c0.w, v.x, appgl_df64_mul(m.c1.w, v.y)), appgl_df64_mul(m.c2.w, v.z)), appgl_df64_mul(m.c3.w, v.w)));",
+		"}",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64x2 v, appgl_df64mat2x2 m)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_madd(v.x, m.c0.x, appgl_df64_mul(v.y, m.c0.y)),",
+		"                        appgl_df64_madd(v.x, m.c1.x, appgl_df64_mul(v.y, m.c1.y)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64x3 v, appgl_df64mat3x3 m)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_madd(v.x, m.c0.x, appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)),",
+		"                        appgl_df64_add(appgl_df64_madd(v.x, m.c1.x, appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)),",
+		"                        appgl_df64_add(appgl_df64_madd(v.x, m.c2.x, appgl_df64_mul(v.y, m.c2.y)), appgl_df64_mul(v.z, m.c2.z)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64x4 v, appgl_df64mat4x4 m)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_add(appgl_df64_madd(v.x, m.c0.x, appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)), appgl_df64_mul(v.w, m.c0.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(v.x, m.c1.x, appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)), appgl_df64_mul(v.w, m.c1.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(v.x, m.c2.x, appgl_df64_mul(v.y, m.c2.y)), appgl_df64_mul(v.z, m.c2.z)), appgl_df64_mul(v.w, m.c2.w)),",
+		"                        appgl_df64_add(appgl_df64_add(appgl_df64_madd(v.x, m.c3.x, appgl_df64_mul(v.y, m.c3.y)), appgl_df64_mul(v.z, m.c3.z)), appgl_df64_mul(v.w, m.c3.w)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64mat2x3 m, appgl_df64x2 v)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_add(appgl_df64_mul(m.c0.z, v.x), appgl_df64_mul(m.c1.z, v.y)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64mat2x4 m, appgl_df64x2 v)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_add(appgl_df64_mul(m.c0.z, v.x), appgl_df64_mul(m.c1.z, v.y)), appgl_df64_add(appgl_df64_mul(m.c0.w, v.x), appgl_df64_mul(m.c1.w, v.y)));",
+		"}",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64mat3x2 m, appgl_df64x3 v)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64mat3x4 m, appgl_df64x3 v)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.z, v.x), appgl_df64_mul(m.c1.z, v.y)), appgl_df64_mul(m.c2.z, v.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.w, v.x), appgl_df64_mul(m.c1.w, v.y)), appgl_df64_mul(m.c2.w, v.z)));",
+		"}",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64mat4x2 m, appgl_df64x4 v)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)), appgl_df64_mul(m.c3.x, v.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)), appgl_df64_mul(m.c3.y, v.w)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64mat4x3 m, appgl_df64x4 v)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.x, v.x), appgl_df64_mul(m.c1.x, v.y)), appgl_df64_mul(m.c2.x, v.z)), appgl_df64_mul(m.c3.x, v.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.y, v.x), appgl_df64_mul(m.c1.y, v.y)), appgl_df64_mul(m.c2.y, v.z)), appgl_df64_mul(m.c3.y, v.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(m.c0.z, v.x), appgl_df64_mul(m.c1.z, v.y)), appgl_df64_mul(m.c2.z, v.z)), appgl_df64_mul(m.c3.z, v.w)));",
+		"}",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64x3 v, appgl_df64mat2x3 m)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)));",
+		"}",
+		"inline appgl_df64x2 appgl_df64_mul(appgl_df64x4 v, appgl_df64mat2x4 m)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)), appgl_df64_mul(v.w, m.c0.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)), appgl_df64_mul(v.w, m.c1.w)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64x2 v, appgl_df64mat3x2 m)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_add(appgl_df64_mul(v.x, m.c2.x), appgl_df64_mul(v.y, m.c2.y)));",
+		"}",
+		"inline appgl_df64x3 appgl_df64_mul(appgl_df64x4 v, appgl_df64mat3x4 m)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)), appgl_df64_mul(v.w, m.c0.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)), appgl_df64_mul(v.w, m.c1.w)), appgl_df64_add(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c2.x), appgl_df64_mul(v.y, m.c2.y)), appgl_df64_mul(v.z, m.c2.z)), appgl_df64_mul(v.w, m.c2.w)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64x2 v, appgl_df64mat4x2 m)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_add(appgl_df64_mul(v.x, m.c2.x), appgl_df64_mul(v.y, m.c2.y)), appgl_df64_add(appgl_df64_mul(v.x, m.c3.x), appgl_df64_mul(v.y, m.c3.y)));",
+		"}",
+		"inline appgl_df64x4 appgl_df64_mul(appgl_df64x3 v, appgl_df64mat4x3 m)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c0.x), appgl_df64_mul(v.y, m.c0.y)), appgl_df64_mul(v.z, m.c0.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c1.x), appgl_df64_mul(v.y, m.c1.y)), appgl_df64_mul(v.z, m.c1.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c2.x), appgl_df64_mul(v.y, m.c2.y)), appgl_df64_mul(v.z, m.c2.z)), appgl_df64_add(appgl_df64_add(appgl_df64_mul(v.x, m.c3.x), appgl_df64_mul(v.y, m.c3.y)), appgl_df64_mul(v.z, m.c3.z)));",
+		"}",
+		"inline appgl_df64mat2x2 appgl_df64_mul(appgl_df64mat2x2 a, appgl_df64mat2x2 b) { return appgl_df64mat2x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x3 appgl_df64_mul(appgl_df64mat3x3 a, appgl_df64mat3x3 b) { return appgl_df64mat3x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x4 appgl_df64_mul(appgl_df64mat4x4 a, appgl_df64mat4x4 b) { return appgl_df64mat4x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat3x2 appgl_df64_mul(appgl_df64mat2x2 a, appgl_df64mat3x2 b) { return appgl_df64mat3x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x2 appgl_df64_mul(appgl_df64mat2x2 a, appgl_df64mat4x2 b) { return appgl_df64mat4x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x3 appgl_df64_mul(appgl_df64mat2x3 a, appgl_df64mat2x2 b) { return appgl_df64mat2x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x3 appgl_df64_mul(appgl_df64mat2x3 a, appgl_df64mat3x2 b) { return appgl_df64mat3x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x3 appgl_df64_mul(appgl_df64mat2x3 a, appgl_df64mat4x2 b) { return appgl_df64mat4x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x4 appgl_df64_mul(appgl_df64mat2x4 a, appgl_df64mat2x2 b) { return appgl_df64mat2x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x4 appgl_df64_mul(appgl_df64mat2x4 a, appgl_df64mat3x2 b) { return appgl_df64mat3x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x4 appgl_df64_mul(appgl_df64mat2x4 a, appgl_df64mat4x2 b) { return appgl_df64mat4x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x2 appgl_df64_mul(appgl_df64mat3x2 a, appgl_df64mat2x3 b) { return appgl_df64mat2x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x2 appgl_df64_mul(appgl_df64mat3x2 a, appgl_df64mat3x3 b) { return appgl_df64mat3x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x2 appgl_df64_mul(appgl_df64mat3x2 a, appgl_df64mat4x3 b) { return appgl_df64mat4x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x3 appgl_df64_mul(appgl_df64mat3x3 a, appgl_df64mat2x3 b) { return appgl_df64mat2x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat4x3 appgl_df64_mul(appgl_df64mat3x3 a, appgl_df64mat4x3 b) { return appgl_df64mat4x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x4 appgl_df64_mul(appgl_df64mat3x4 a, appgl_df64mat2x3 b) { return appgl_df64mat2x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x4 appgl_df64_mul(appgl_df64mat3x4 a, appgl_df64mat3x3 b) { return appgl_df64mat3x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x4 appgl_df64_mul(appgl_df64mat3x4 a, appgl_df64mat4x3 b) { return appgl_df64mat4x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x2 appgl_df64_mul(appgl_df64mat4x2 a, appgl_df64mat2x4 b) { return appgl_df64mat2x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x2 appgl_df64_mul(appgl_df64mat4x2 a, appgl_df64mat3x4 b) { return appgl_df64mat3x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x2 appgl_df64_mul(appgl_df64mat4x2 a, appgl_df64mat4x4 b) { return appgl_df64mat4x2(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x3 appgl_df64_mul(appgl_df64mat4x3 a, appgl_df64mat2x4 b) { return appgl_df64mat2x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x3 appgl_df64_mul(appgl_df64mat4x3 a, appgl_df64mat3x4 b) { return appgl_df64mat3x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64mat4x3 appgl_df64_mul(appgl_df64mat4x3 a, appgl_df64mat4x4 b) { return appgl_df64mat4x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
+		"inline appgl_df64mat2x4 appgl_df64_mul(appgl_df64mat4x4 a, appgl_df64mat2x4 b) { return appgl_df64mat2x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
+		"inline appgl_df64mat3x4 appgl_df64_mul(appgl_df64mat4x4 a, appgl_df64mat3x4 b) { return appgl_df64mat3x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		"inline appgl_df64 operator+(appgl_df64 a, appgl_df64 b) { return appgl_df64_add(a, b); }",
+		"inline appgl_df64 operator-(appgl_df64 a, appgl_df64 b) { return appgl_df64_sub(a, b); }",
+		"inline appgl_df64 operator-(appgl_df64 a) { return appgl_df64_neg(a); }",
+		"inline appgl_df64 operator*(appgl_df64 a, appgl_df64 b) { return appgl_df64_mul(a, b); }",
+		"inline appgl_df64 operator/(appgl_df64 a, appgl_df64 b) { return appgl_df64_div(a, b); }",
+		"inline bool operator==(appgl_df64 a, appgl_df64 b) { return appgl_df64_eq(a, b); }",
+		"inline bool operator!=(appgl_df64 a, appgl_df64 b) { return appgl_df64_ne(a, b); }",
+		"inline bool operator<(appgl_df64 a, appgl_df64 b) { return appgl_df64_lt(a, b); }",
+		"inline bool operator>(appgl_df64 a, appgl_df64 b) { return appgl_df64_gt(a, b); }",
+		"inline bool operator<=(appgl_df64 a, appgl_df64 b) { return appgl_df64_le(a, b); }",
+		"inline bool operator>=(appgl_df64 a, appgl_df64 b) { return appgl_df64_ge(a, b); }",
+	};
+
+	for (auto *line : lines)
+		statement(line);
+	statement("");
+}
+
 // Emits the file header info
 void CompilerMSL::emit_header()
 {
@@ -5801,6 +7277,9 @@ void CompilerMSL::emit_header()
 	statement("");
 	statement("using namespace metal;");
 	statement("");
+
+	if (appgl_fp64_module_uses_emulation())
+		emit_appgl_fp64_emulation_helpers();
 
 	for (auto &td : typedef_lines)
 		statement(td);
@@ -8403,21 +9882,48 @@ void CompilerMSL::emit_resources()
 	emit_interface_block(stage_in_var_id);
 	emit_interface_block(patch_stage_in_var_id);
 
-	if (get_execution_model() == ExecutionModelMeshEXT)
+	if (is_mesh_shader())
 	{
 		auto &execution = get_entry_point();
 		const char *topology = "";
-		if (execution.flags.get(ExecutionModeOutputTrianglesEXT))
-			topology = "topology::triangle";
-		else if (execution.flags.get(ExecutionModeOutputLinesEXT))
-			topology = "topology::line";
-		else if (execution.flags.get(ExecutionModeOutputPoints))
-			topology = "topology::point";
+		uint32_t max_primitives = execution.output_primitives;
+		if (get_execution_model() == ExecutionModelMeshEXT)
+		{
+			if (execution.flags.get(ExecutionModeOutputTrianglesEXT))
+				topology = "topology::triangle";
+			else if (execution.flags.get(ExecutionModeOutputLinesEXT))
+				topology = "topology::line";
+			else if (execution.flags.get(ExecutionModeOutputPoints))
+				topology = "topology::point";
+		}
+		else if (msl_options.geometry_shader_as_mesh && get_execution_model() == ExecutionModelGeometry)
+		{
+			// AppGL fork (msl-geometry-shader-as-mesh.patch): derive
+			// mesh topology from GS output mode. GS uses different
+			// SPIR-V execution modes than mesh shaders. max_primitives
+			// is computed from max_vertices because GS doesn't carry a
+			// dedicated max_primitives mode.
+			if (execution.flags.get(ExecutionModeOutputTriangleStrip))
+			{
+				topology = "topology::triangle";
+				max_primitives = execution.output_vertices > 2 ? execution.output_vertices - 2 : 1;
+			}
+			else if (execution.flags.get(ExecutionModeOutputLineStrip))
+			{
+				topology = "topology::line";
+				max_primitives = execution.output_vertices > 1 ? execution.output_vertices - 1 : 1;
+			}
+			else if (execution.flags.get(ExecutionModeOutputPoints))
+			{
+				topology = "topology::point";
+				max_primitives = execution.output_vertices;
+			}
+		}
 
 		const char *per_vertex = mesh_out_per_vertex ? "spvPerVertex" : "float4";
 		const char *per_primitive = mesh_out_per_primitive ? "spvPerPrimitive" : "void";
 		statement("using spvMesh_t = mesh<", per_vertex, ", ", per_primitive, ", ", execution.output_vertices, ", ",
-		          execution.output_primitives, ", ", topology, ">;");
+		          max_primitives, ", ", topology, ">;");
 		statement("");
 	}
 }
@@ -9517,7 +11023,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpLogicalEqual:
 	case OpFOrdEqual:
-		MSL_BOP(==);
+		if (opcode == OpFOrdEqual && appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_eq);
+		else
+			MSL_BOP(==);
 		break;
 
 	case OpINotEqual:
@@ -9530,7 +11039,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		// Typically OrdNotEqual comes from GLSL which itself does not really specify what
 		// happens with NaN.
 		// Consider fixing this if we run into real issues.
-		MSL_BOP(!=);
+		if (opcode == OpFOrdNotEqual && appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ne);
+		else
+			MSL_BOP(!=);
 		break;
 
 	case OpUGreaterThan:
@@ -9542,7 +11054,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdGreaterThan:
-		MSL_BOP(>);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_gt);
+		else
+			MSL_BOP(>);
 		break;
 
 	case OpUGreaterThanEqual:
@@ -9554,7 +11069,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdGreaterThanEqual:
-		MSL_BOP(>=);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ge);
+		else
+			MSL_BOP(>=);
 		break;
 
 	case OpULessThan:
@@ -9566,7 +11084,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdLessThan:
-		MSL_BOP(<);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_lt);
+		else
+			MSL_BOP(<);
 		break;
 
 	case OpULessThanEqual:
@@ -9578,33 +11099,54 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdLessThanEqual:
-		MSL_BOP(<=);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_le);
+		else
+			MSL_BOP(<=);
 		break;
 
 	case OpFUnordEqual:
-		MSL_UNORD_BOP(==);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ueq);
+		else
+			MSL_UNORD_BOP(==);
 		break;
 
 	case OpFUnordNotEqual:
 		// not equal in MSL generates une opcodes to begin with.
 		// Since unordered not equal is how it works in C, just inherit that behavior.
-		MSL_BOP(!=);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_une);
+		else
+			MSL_BOP(!=);
 		break;
 
 	case OpFUnordGreaterThan:
-		MSL_UNORD_BOP(>);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ugt);
+		else
+			MSL_UNORD_BOP(>);
 		break;
 
 	case OpFUnordGreaterThanEqual:
-		MSL_UNORD_BOP(>=);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_uge);
+		else
+			MSL_UNORD_BOP(>=);
 		break;
 
 	case OpFUnordLessThan:
-		MSL_UNORD_BOP(<);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ult);
+		else
+			MSL_UNORD_BOP(<);
 		break;
 
 	case OpFUnordLessThanEqual:
-		MSL_UNORD_BOP(<=);
+		if (appgl_fp64_emulation_enabled_for_type(expression_type(ops[2])))
+			MSL_BFOP(appgl_df64_ule);
+		else
+			MSL_UNORD_BOP(<=);
 		break;
 
 	// Pointer math
@@ -9619,6 +11161,74 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	case OpPtrDiff:
 		MSL_PTR_BOP(-);
 		break;
+
+	// AppGL df64 conversions.
+	case OpFConvert:
+	{
+		uint32_t result_type = ops[0];
+		uint32_t id = ops[1];
+		uint32_t arg = ops[2];
+		auto &dst_type = get<SPIRType>(result_type);
+		auto &src_type = expression_type(arg);
+
+		if (appgl_fp64_emulation_enabled_for_type(dst_type) && src_type.basetype == SPIRType::Float)
+		{
+			MSL_UFOP(appgl_df64_from_float);
+		}
+		else if (dst_type.basetype == SPIRType::Float && appgl_fp64_emulation_enabled_for_type(src_type))
+		{
+			auto expr = join(type_to_glsl_constructor(dst_type), "(appgl_df64_to_float(", to_unpacked_expression(arg), "))");
+			emit_op(result_type, id, expr, should_forward(arg));
+			inherit_expression_dependencies(id, arg);
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+	}
+
+	case OpConvertSToF:
+	case OpConvertUToF:
+	{
+		uint32_t result_type = ops[0];
+		uint32_t id = ops[1];
+		uint32_t arg = ops[2];
+		auto &dst_type = get<SPIRType>(result_type);
+
+		if (appgl_fp64_emulation_enabled_for_type(dst_type))
+		{
+			SPIRType float_type = dst_type;
+			float_type.basetype = SPIRType::Float;
+			float_type.width = 32;
+			auto expr = join("appgl_df64_from_float(", type_to_glsl_constructor(float_type), "(",
+			                 to_unpacked_expression(arg), "))");
+			emit_op(result_type, id, expr, should_forward(arg));
+			inherit_expression_dependencies(id, arg);
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+	}
+
+	case OpConvertFToS:
+	case OpConvertFToU:
+	{
+		uint32_t result_type = ops[0];
+		uint32_t id = ops[1];
+		uint32_t arg = ops[2];
+		auto &src_type = expression_type(arg);
+
+		if (appgl_fp64_emulation_enabled_for_type(src_type))
+		{
+			auto &dst_type = get<SPIRType>(result_type);
+			auto expr = join(type_to_glsl_constructor(dst_type), "(appgl_df64_to_float(",
+			                 to_unpacked_expression(arg), "))");
+			emit_op(result_type, id, expr, should_forward(arg));
+			inherit_expression_dependencies(id, arg);
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+	}
 
 	// Derivatives
 	case OpDPdx:
@@ -9684,28 +11294,59 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFMul:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_BFOP(appgl_df64_mul);
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFMul);
 		else
 			MSL_BOP(*);
 		break;
 
 	case OpFAdd:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_BFOP(appgl_df64_add);
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFAdd);
 		else
 			MSL_BOP(+);
 		break;
 
 	case OpFSub:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_BFOP(appgl_df64_sub);
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFSub);
 		else
 			MSL_BOP(-);
 		break;
 
+	case OpFDiv:
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_BFOP(appgl_df64_div);
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpFNegate:
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_UFOP(appgl_df64_neg);
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpVectorTimesScalar:
+	case OpMatrixTimesScalar:
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_BFOP(appgl_df64_mul);
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
 	case OpFmaKHR:
-		MSL_TFOP(fma);
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+			MSL_TFOP(appgl_df64_madd);
+		else
+			MSL_TFOP(fma);
 		break;
 
 	// Atomics
@@ -9893,6 +11534,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			string tex_coords = "uint2(" + round_fp_tex_coords(coord, coord_is_fp) + ")";
 			string sample_expr = "uint(" + to_unpacked_expression(sample) + ")";
 			string slice_expr = sample_expr;
+			string residency_args = tex_coords + ", " + sample_expr;
 			if (img_type.image.arrayed)
 			{
 				uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
@@ -9901,14 +11543,126 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 				    ")";
 				slice_expr = join("((", layer, " * appgl_ms_storage_image_samples[",
 				                  resource_index, "]) + ", sample_expr, ")");
+				residency_args = tex_coords + ", " + layer + ", " + sample_expr;
 			}
 
-			string expr = join(to_expression(img_id), ".read(", tex_coords, ", ", slice_expr, ")");
+			uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
+			auto appgl_sparse_storage_zero = [&]() {
+				auto &return_type = get<SPIRType>(result_type);
+				string type_name = type_to_glsl(return_type);
+				bool alpha_one = false;
+				switch (img_type.image.format)
+				{
+				case ImageFormatR32f:
+				case ImageFormatR16f:
+				case ImageFormatR8:
+				case ImageFormatR16:
+				case ImageFormatR8Snorm:
+				case ImageFormatR16Snorm:
+				case ImageFormatR32i:
+				case ImageFormatR16i:
+				case ImageFormatR8i:
+				case ImageFormatR32ui:
+				case ImageFormatR16ui:
+				case ImageFormatR8ui:
+				case ImageFormatRg32f:
+				case ImageFormatRg16f:
+				case ImageFormatRg16:
+				case ImageFormatRg8:
+				case ImageFormatRg16Snorm:
+				case ImageFormatRg8Snorm:
+				case ImageFormatRg32i:
+				case ImageFormatRg16i:
+				case ImageFormatRg8i:
+				case ImageFormatRg32ui:
+				case ImageFormatRg16ui:
+				case ImageFormatRg8ui:
+				case ImageFormatR11fG11fB10f:
+					alpha_one = true;
+					break;
+				default:
+					break;
+				}
+				return alpha_one ? join(type_name, "(0, 0, 0, 1)") : join(type_name, "(0)");
+			};
+			string sparse_name = join("appgl_ms_storage_sparse_", resource_index);
+			statement("// APPGL_MS_STORAGE_SPARSE_RESIDENCY_SLOT_", resource_index,
+			          "_ARRAY_", img_type.image.arrayed ? 1 : 0);
+			string residency_call = join(sparse_name, ".sparse_read(", residency_args, ")");
+			string value_call = join(to_expression(img_id), ".read(", tex_coords, ", ", slice_expr, ")");
+			string expr = join("(", residency_call, ".resident() ? ", value_call, " : ",
+			                   appgl_sparse_storage_zero(), ")");
 			emit_op(result_type, id, expr,
 			        should_forward(img_id) && should_forward(coord_id) && should_forward(sample));
 			inherit_expression_dependencies(id, img_id);
 			inherit_expression_dependencies(id, coord_id);
 			inherit_expression_dependencies(id, sample);
+			break;
+		}
+
+		const bool appgl_sparse_storage_image_read =
+		    get_execution_model() == ExecutionModelGLCompute &&
+		    type.basetype == SPIRType::Image &&
+		    img_type.image.sampled == 2 &&
+		    !img_type.image.ms &&
+		    (img_type.image.dim == Dim2D ||
+		     img_type.image.dim == Dim3D ||
+		     img_type.image.dim == DimCube ||
+		     img_type.image.dim == DimRect);
+		if (appgl_sparse_storage_image_read)
+		{
+			auto appgl_sparse_storage_zero = [&]() {
+				auto &return_type = get<SPIRType>(result_type);
+				string type_name = type_to_glsl(return_type);
+				bool alpha_one = false;
+				switch (img_type.image.format)
+				{
+				case ImageFormatR32f:
+				case ImageFormatR16f:
+				case ImageFormatR8:
+				case ImageFormatR16:
+				case ImageFormatR8Snorm:
+				case ImageFormatR16Snorm:
+				case ImageFormatR32i:
+				case ImageFormatR16i:
+				case ImageFormatR8i:
+				case ImageFormatR32ui:
+				case ImageFormatR16ui:
+				case ImageFormatR8ui:
+				case ImageFormatRg32f:
+				case ImageFormatRg16f:
+				case ImageFormatRg16:
+				case ImageFormatRg8:
+				case ImageFormatRg16Snorm:
+				case ImageFormatRg8Snorm:
+				case ImageFormatRg32i:
+				case ImageFormatRg16i:
+				case ImageFormatRg8i:
+				case ImageFormatRg32ui:
+				case ImageFormatRg16ui:
+				case ImageFormatRg8ui:
+				case ImageFormatR11fG11fB10f:
+					alpha_one = true;
+					break;
+				default:
+					break;
+				}
+				return alpha_one ? join(type_name, "(0, 0, 0, 1)") : join(type_name, "(0)");
+			};
+
+			bool forward = false;
+			SmallVector<uint32_t> inherited_expressions;
+			string sparse_call = to_texture_op(instruction, false, &forward, inherited_expressions);
+			const string read_call = ".read(";
+			size_t read_pos = sparse_call.find(read_call);
+			if (read_pos == string::npos)
+				SPIRV_CROSS_THROW("AppGL sparse storage-image read could not locate Metal read call.");
+			sparse_call.replace(read_pos, read_call.size(), ".sparse_read(");
+			string expr = join("(", sparse_call, ".resident() ? ", sparse_call, ".value() : ",
+			                   appgl_sparse_storage_zero(), ")");
+			emit_op(result_type, id, expr, forward);
+			for (auto &inherit : inherited_expressions)
+				inherit_expression_dependencies(id, inherit);
 			break;
 		}
 
@@ -10060,6 +11814,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			string tex_coords = "uint2(" + round_fp_tex_coords(coord, coord_is_fp) + ")";
 			string sample_expr = "uint(" + to_unpacked_expression(sample) + ")";
 			string slice_expr = sample_expr;
+			string residency_args = tex_coords + ", " + sample_expr;
 			if (img_type.image.arrayed)
 			{
 				uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
@@ -10068,11 +11823,17 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 				    ")";
 				slice_expr = join("((", layer, " * appgl_ms_storage_image_samples[",
 				                  resource_index, "]) + ", sample_expr, ")");
+				residency_args = tex_coords + ", " + layer + ", " + sample_expr;
 			}
+			uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
+			string sparse_name = join("appgl_ms_storage_sparse_", resource_index);
+			statement("// APPGL_MS_STORAGE_SPARSE_RESIDENCY_SLOT_", resource_index,
+			          "_ARRAY_", img_type.image.arrayed ? 1 : 0);
+			string resident_expr = join(sparse_name, ".sparse_read(", residency_args, ").resident()");
 			forward = should_forward(coord_id) && should_forward(sample);
-			expr += join(to_expression(img_id), ".write(",
+			expr += join("if (", resident_expr, ") { ", to_expression(img_id), ".write(",
 			             remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)), ", ",
-			             tex_coords, ", ", slice_expr, ")");
+			             tex_coords, ", ", slice_expr, "); }");
 		}
 		else
 		{
@@ -10119,7 +11880,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		string expr = type_to_glsl(rslt_type) + "(";
 		expr += img_exp + ".get_width(" + lod + ")";
 
-		if (img_dim == Dim2D || img_dim == DimCube || img_dim == Dim3D)
+		// CKPT119 (AppGL): include DimRect (image2DRect / sampler2DRect) so
+		// imageSize / textureSize emit BOTH width and height. Upstream
+		// omits DimRect from this list, causing `int2(get_width())` to
+		// duplicate width into both components. CTS shader_image_size.*
+		// rect-sized cases (16x8) returned (16,16) before this fix.
+		if (img_dim == Dim2D || img_dim == DimCube || img_dim == Dim3D || img_dim == DimRect)
 			expr += ", " + img_exp + ".get_height(" + lod + ")";
 
 		if (img_dim == Dim3D)
@@ -10291,6 +12057,63 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		if (is_out_of_bounds_tessellation_level(ops[0]))
 			break;
 
+		// AppGL fork (msl-geometry-shader-as-mesh.patch): when GS source
+		// is being emitted as a mesh shader, OpStore to a per-vertex /
+		// per-primitive output must redirect into the function-local
+		// spvVertices[spvVertexIndex].MEMBER or spvCurrentPrim.MEMBER,
+		// not the source-level global / SPIRV-Cross threadgroup
+		// variable which doesn't carry the mesh-output semantics.
+		//
+		// Approach: use to_pointer_expression(ops[0]) to get the LHS
+		// expression as SPIRV-Cross would normally emit (e.g.,
+		// "gl_out.gl_Position", "out_color", or
+		// "_RESERVED_IDENTIFIER_FIXUP_gl_Layer"), then rewrite the
+		// variable-prefix into the appropriate per-vertex / per-primitive
+		// target.
+		if (msl_options.geometry_shader_as_mesh &&
+		    get_execution_model() == ExecutionModelGeometry)
+		{
+			auto *target_var = maybe_get_backing_variable(ops[0]);
+			if (target_var && target_var->storage == StorageClassOutput)
+			{
+				const bool per_primitive = is_per_primitive_variable(*target_var);
+				// to_pointer_expression returns "&MEMBER" form for the
+				// pointer LHS (verified via APPGL_GS_AS_MESH_TRACE).
+				// e.g. "&gl_Position", "&out_color", "&gl_Layer".
+				// Strip the leading '&' to get the bare member name.
+				std::string member = to_pointer_expression(ops[0]);
+				if (!member.empty() && member.front() == '&')
+					member.erase(0, 1);
+				// Strip the SPIRV-Cross sanitization prefix if present
+				// (e.g. "_RESERVED_IDENTIFIER_FIXUP_gl_Layer" → "gl_Layer").
+				const std::string sanitize_prefix = "_RESERVED_IDENTIFIER_FIXUP_";
+				if (member.compare(0, sanitize_prefix.size(), sanitize_prefix) == 0)
+					member.erase(0, sanitize_prefix.size());
+
+				if (!member.empty())
+				{
+					if (per_primitive)
+					{
+						// Phase 2.5 Gap C: write to function-local shadow
+						// FIRST (declared in fixup_hooks_in alongside
+						// spvCurrentPrim), THEN propagate to spvCurrentPrim
+						// from the shadow. Subsequent body OpLoads of the
+						// per-primitive identifier (e.g. `int(gl_Layer)`)
+						// resolve to the shadow.
+						statement(member, " = ",
+						          to_unpacked_expression(ops[1]), ";");
+						statement("spvCurrentPrim.", member, " = ", member, ";");
+					}
+					else
+					{
+						statement("spvVertices[spvVertexIndex].", member, " = ",
+						          to_unpacked_expression(ops[1]), ";");
+					}
+					break;
+				}
+			}
+		}
+
 		if (needs_frag_discard_checks() &&
 		    (type.storage == StorageClassStorageBuffer || type.storage == StorageClassUniform))
 		{
@@ -10313,6 +12136,91 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			end_scope();
 		if (has_decoration(ops[0], DecorationBuiltIn) && get_decoration(ops[0], DecorationBuiltIn) == BuiltInPointSize)
 			writes_to_point_size = true;
+
+		// Path L extension (gate 17 dual-write): when the
+		// `use_full_precision_tess_level_buffer` flag is set on a
+		// TCS-compute target, emit an additional full-precision write
+		// to `spvTessLevelFull[primId * stride + idx]` alongside the
+		// existing `spvTessLevel[primId].edgeTessellationFactor[idx] =
+		// half(val)` half-precision write. The TCS-compute kernel
+		// already computes the full-precision values; dual-write
+		// eliminates the host-side packing fragility (consumer doesn't
+		// have to extract values from GL uniform state).
+		//
+		// Detection: target backing variable is BuiltInTessLevelOuter
+		// or BuiltInTessLevelInner with StorageClassOutput. Index
+		// extracted by string-parsing the resolved LHS expression
+		// (well-defined tess-level access patterns:
+		// `spvTessLevel[<primId>].edgeTessellationFactor[<idx>]`,
+		// `spvTessLevel[<primId>].insideTessellationFactor[<idx>]`,
+		// or `spvTessLevel[<primId>].insideTessellationFactor` (triangle
+		// inner scalar)).
+		if (msl_options.use_full_precision_tess_level_buffer && is_tesc_shader())
+		{
+			auto *target_var = maybe_get_backing_variable(ops[0]);
+			if (target_var && target_var->storage == StorageClassOutput &&
+			    has_decoration(target_var->self, DecorationBuiltIn))
+			{
+				BuiltIn bi = BuiltIn(get_decoration(target_var->self, DecorationBuiltIn));
+				if (bi == BuiltInTessLevelOuter || bi == BuiltInTessLevelInner)
+				{
+					bool isolines = get_entry_point().flags.get(ExecutionModeIsolines);
+					bool triangles = is_tessellating_triangles();
+					uint32_t outer_count = isolines ? 2u : (triangles ? 3u : 4u);
+					uint32_t inner_count = isolines ? 0u : (triangles ? 1u : 2u);
+					uint32_t stride = outer_count + inner_count;
+
+					// Extract index from the resolved LHS expression.
+					std::string lhs = to_expression(ops[0]);
+					std::string idx_expr;
+					std::string base_offset_expr;
+					if (bi == BuiltInTessLevelOuter)
+					{
+						const std::string marker = ".edgeTessellationFactor[";
+						size_t pos = lhs.find(marker);
+						if (pos != std::string::npos)
+						{
+							size_t open = pos + marker.size();
+							size_t close = lhs.find(']', open);
+							if (close != std::string::npos)
+							{
+								idx_expr = lhs.substr(open, close - open);
+								base_offset_expr = idx_expr;
+							}
+						}
+					}
+					else // BuiltInTessLevelInner
+					{
+						const std::string array_marker = ".insideTessellationFactor[";
+						size_t pos = lhs.find(array_marker);
+						if (pos != std::string::npos)
+						{
+							size_t open = pos + array_marker.size();
+							size_t close = lhs.find(']', open);
+							if (close != std::string::npos)
+							{
+								idx_expr = lhs.substr(open, close - open);
+								base_offset_expr = std::to_string(outer_count) + "u + " + idx_expr;
+							}
+						}
+						else if (lhs.find(".insideTessellationFactor") != std::string::npos)
+						{
+							// Triangle inner: scalar access (no [idx]).
+							idx_expr = "0";
+							base_offset_expr = std::to_string(outer_count) + "u";
+						}
+					}
+
+					if (!base_offset_expr.empty())
+					{
+						statement("spvTessLevelFull[",
+						          to_expression(builtin_primitive_id_id), " * ",
+						          stride, "u + ", base_offset_expr, "] = ",
+						          to_unpacked_expression(ops[1]), ";");
+					}
+				}
+			}
+		}
 
 		break;
 	}
@@ -10358,6 +12266,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	case OpVectorTimesMatrix:
 	case OpMatrixTimesVector:
 	{
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+		{
+			MSL_BFOP(appgl_df64_mul);
+			break;
+		}
+
 		if (!msl_options.invariant_float_math && !has_legacy_nocontract(ops[0], ops[1]))
 		{
 			CompilerGLSL::emit_instruction(instruction);
@@ -10400,6 +12314,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpMatrixTimesMatrix:
 	{
+		if (appgl_fp64_emulation_enabled_for_type_id(ops[0]))
+		{
+			MSL_BFOP(appgl_df64_mul);
+			break;
+		}
+
 		if (!msl_options.invariant_float_math && !has_legacy_nocontract(ops[0], ops[1]))
 		{
 			CompilerGLSL::emit_instruction(instruction);
@@ -10852,6 +12772,50 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 	}
 
+	// AppGL fork (msl-geometry-shader-as-mesh.patch): GS opcode translation
+	// when emitting GS source as Metal mesh shader form.
+	case OpEmitVertex:
+	{
+		if (msl_options.geometry_shader_as_mesh && get_execution_model() == ExecutionModelGeometry)
+		{
+			// The actual per-vertex output capture is handled by the
+			// OpStore intercept (Component 4) which redirects writes to
+			// per-vertex output globals into spvMesh.set_vertex(spvVertexIndex, ...).
+			// Here we just advance the vertex counter and mark that an
+			// implicit EndPrimitive at function exit is owed (per GL 4.6
+			// §11.3.4 — Path H spec compliance).
+			statement("++spvVertexIndex;");
+			statement("spvNeedImplicitEndPrimitive = true;");
+			break;
+		}
+		// Fall through to the inherited GLSL emission (which produces literal
+		// `EmitVertex();` — never Metal-valid, but preserves prior behaviour
+		// for callers without the option).
+		CompilerGLSL::emit_instruction(instruction);
+		break;
+	}
+
+	case OpEndPrimitive:
+	{
+		if (msl_options.geometry_shader_as_mesh && get_execution_model() == ExecutionModelGeometry)
+		{
+			// Phase 2.5 Gap B: emit the EndPrimitive flush via the
+			// shared helper, which selects between simple and
+			// strip-to-list expansion based on output topology +
+			// max_vertices. Per GL §10.1.13 a triangle_strip of N
+			// vertices represents (N-2) triangles with alternating
+			// winding; line_strip of N vertices = (N-1) line segments.
+			emit_gs_as_mesh_endprimitive();
+			// Path H: clear the implicit-EndPrimitive-owed flag — this
+			// EndPrimitive flushed the current strip/run, so the
+			// function-exit implicit emit doesn't need to fire.
+			statement("spvNeedImplicitEndPrimitive = false;");
+			break;
+		}
+		CompilerGLSL::emit_instruction(instruction);
+		break;
+	}
+
 	case OpAssumeTrueKHR:
 	{
 		auto condition = ops[0];
@@ -11240,7 +13204,8 @@ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
 		if (get_execution_model() == ExecutionModelGLCompute &&
 		    (op == OpImageSparseFetch ||
 		     op == OpImageSparseSampleImplicitLod ||
-		     op == OpImageSparseSampleExplicitLod))
+		     op == OpImageSparseSampleExplicitLod ||
+		     op == OpImageSparseGather))
 		{
 			auto &sampled_type = expression_type(img);
 			auto &imgtype = get<SPIRType>(sampled_type.self);
@@ -11262,6 +13227,132 @@ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
 				bool sparse_forward = false;
 				SmallVector<uint32_t> sparse_inherited;
 				string sparse_call = to_texture_op(i, true, &sparse_forward, sparse_inherited);
+				auto trim_sparse_arg = [](string value) {
+					auto first = value.find_first_not_of(" \t\n\r");
+					auto last = value.find_last_not_of(" \t\n\r");
+					if (first == string::npos || last == string::npos)
+						return string();
+					return value.substr(first, last - first + 1);
+				};
+				const string helper_prefix = "spvGatherConstOffsets(";
+				if (sparse_call.find(helper_prefix) == 0)
+				{
+					vector<string> args;
+					string current;
+					unsigned depth = 0;
+					for (size_t pos = helper_prefix.size(); pos + 1 < sparse_call.size(); ++pos)
+					{
+						char ch = sparse_call[pos];
+						if (ch == '(' || ch == '[' || ch == '{')
+							depth++;
+						else if (ch == ')' || ch == ']' || ch == '}')
+						{
+							if (depth == 0)
+								break;
+							depth--;
+						}
+						if (ch == ',' && depth == 0)
+						{
+							args.push_back(trim_sparse_arg(current));
+							current.clear();
+							continue;
+						}
+						current.push_back(ch);
+					}
+					if (!current.empty())
+						args.push_back(trim_sparse_arg(current));
+					if (args.size() >= 5)
+					{
+						string params = args[4];
+						for (size_t arg = 5; arg < args.size(); ++arg)
+							params += ", " + args[arg];
+						sparse_call = args[0] + ".sparse_gather(" + args[1] + ", " +
+						              params + ", " + args[2] + "[0], " + args[3] + ")";
+					}
+				}
+				const string sparse_read_call = ".sparse_read(";
+				auto sparse_read_pos = sparse_call.find(sparse_read_call);
+				if (sparse_read_pos != string::npos)
+				{
+					size_t args_start = sparse_read_pos + sparse_read_call.size();
+					vector<string> args;
+					string current;
+					unsigned depth = 0;
+					size_t args_end = string::npos;
+					for (size_t pos = args_start; pos < sparse_call.size(); ++pos)
+					{
+						char ch = sparse_call[pos];
+						if (ch == '(' || ch == '[' || ch == '{')
+							depth++;
+						else if (ch == ')' || ch == ']' || ch == '}')
+						{
+							if (depth == 0)
+							{
+								args_end = pos;
+								break;
+							}
+							depth--;
+						}
+						if (ch == ',' && depth == 0)
+						{
+							args.push_back(trim_sparse_arg(current));
+							current.clear();
+							continue;
+						}
+						current.push_back(ch);
+					}
+					if (!current.empty())
+						args.push_back(trim_sparse_arg(current));
+					if (args_end != string::npos && !args.empty() &&
+					    args[0].find("uint") != 0 && args[0].find("ushort") != 0)
+					{
+						const bool coord_is_3d =
+						    imgtype.image.dim == Dim3D ||
+						    (imgtype.image.dim == Dim2D && imgtype.image.arrayed);
+						const string coord_cast = coord_is_3d ? "uint3" : "uint2";
+						auto is_unsigned_coord = [](const string &expr) {
+							return expr.find("uint") == 0 || expr.find("ushort") == 0;
+						};
+						auto cast_coord_arg = [&](const string &coord_arg) {
+							unsigned coord_depth = 0;
+							for (size_t pos = 0; pos < coord_arg.size(); ++pos)
+							{
+								char ch = coord_arg[pos];
+								if (ch == '(' || ch == '[' || ch == '{')
+									coord_depth++;
+								else if (ch == ')' || ch == ']' || ch == '}')
+								{
+									if (coord_depth > 0)
+										coord_depth--;
+								}
+								else if ((ch == '+' || ch == '-') && coord_depth == 0 && pos > 0)
+								{
+									string lhs = trim_sparse_arg(coord_arg.substr(0, pos));
+									string rhs = trim_sparse_arg(coord_arg.substr(pos + 1));
+									if (!lhs.empty() && !rhs.empty())
+									{
+										if (!is_unsigned_coord(lhs))
+											lhs = coord_cast + "(" + lhs + ")";
+										if (!is_unsigned_coord(rhs))
+											rhs = coord_cast + "(" + rhs + ")";
+										return lhs + " " + ch + " " + rhs;
+									}
+								}
+							}
+							return coord_cast + "(" + coord_arg + ")";
+						};
+						args[0] = cast_coord_arg(args[0]);
+						string rewritten = sparse_call.substr(0, args_start);
+						for (size_t arg = 0; arg < args.size(); ++arg)
+						{
+							if (arg != 0)
+								rewritten += ", ";
+							rewritten += args[arg];
+						}
+						rewritten += sparse_call.substr(args_end);
+						sparse_call = rewritten;
+					}
+				}
 
 				bool value_forward = false;
 				SmallVector<uint32_t> value_inherited;
@@ -11273,11 +13364,96 @@ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
 				auto *p_var = maybe_get_backing_variable(image_var_id);
 				uint32_t resource_index = p_var ? get_automatic_msl_resource_binding(p_var->self) : 0;
 				string sidecar_name = join("appgl_sparse_sampled_sidecar_", resource_index);
+				string image_expr = to_expression(image_var_id);
 				string image_prefix = to_expression(image_var_id) + ".";
 				auto image_pos = value_call.find(image_prefix);
-				if (image_pos == string::npos)
-					SPIRV_CROSS_THROW("AppGL sparse sampled sidecar could not locate source texture expression.");
-				value_call.replace(image_pos, image_prefix.size(), sidecar_name + ".");
+				if (image_pos != string::npos)
+				{
+					value_call.replace(image_pos, image_prefix.size(), sidecar_name + ".");
+				}
+				else
+				{
+					string helper_first_arg = "(" + image_expr + ",";
+					auto helper_arg_pos = value_call.find(helper_first_arg);
+					if (helper_arg_pos != string::npos)
+					{
+						value_call.replace(helper_arg_pos + 1, image_expr.size(), sidecar_name);
+					}
+					else
+					{
+						auto replace_receiver = [&](const string &method) {
+							auto method_pos = value_call.find(method);
+							if (method_pos == string::npos || method_pos == 0)
+								return false;
+							size_t start = method_pos;
+							while (start > 0)
+							{
+								char ch = value_call[start - 1];
+								if (!(ch == '_' || isalnum(static_cast<unsigned char>(ch))))
+									break;
+								--start;
+							}
+							if (start == method_pos)
+								return false;
+							value_call.replace(start, method_pos - start, sidecar_name);
+							return true;
+						};
+						if (!replace_receiver(".sample(") &&
+						    !replace_receiver(".read(") &&
+						    !replace_receiver(".gather("))
+						{
+							SPIRV_CROSS_THROW("AppGL sparse sampled sidecar could not locate source texture expression.");
+						}
+					}
+				}
+
+				auto insert_zero_gather_offset = [&](string &call, const string &method) {
+					auto method_pos = call.find(method);
+					if (method_pos == string::npos)
+						return;
+					size_t args_start = method_pos + method.size();
+					vector<string> args;
+					string current;
+					unsigned depth = 0;
+					size_t args_end = string::npos;
+					for (size_t pos = args_start; pos < call.size(); ++pos)
+					{
+						char ch = call[pos];
+						if (ch == '(' || ch == '[' || ch == '{')
+							depth++;
+						else if (ch == ')' || ch == ']' || ch == '}')
+						{
+							if (depth == 0)
+							{
+								args_end = pos;
+								break;
+							}
+							depth--;
+						}
+						if (ch == ',' && depth == 0)
+						{
+							args.push_back(trim_sparse_arg(current));
+							current.clear();
+							continue;
+						}
+						current.push_back(ch);
+					}
+					if (!current.empty())
+						args.push_back(trim_sparse_arg(current));
+					if (args_end == string::npos || args.size() != 3 ||
+					    args[2].find("component::") != 0)
+						return;
+
+					string rewritten = call.substr(0, args_start);
+					rewritten += args[0] + ", " + args[1] + ", int2(0), " + args[2];
+					rewritten += call.substr(args_end);
+					call = rewritten;
+				};
+				if (imgtype.image.dim == Dim2D || imgtype.image.dim == DimRect)
+				{
+					insert_zero_gather_offset(sparse_call, ".sparse_gather(");
+					insert_zero_gather_offset(value_call, ".gather(");
+				}
 
 				auto &return_type = get<SPIRType>(result_type_id);
 				if (return_type.basetype != SPIRType::Struct || return_type.member_types.size() != 2)
@@ -12046,6 +14222,67 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 
 	auto &restype = get<SPIRType>(result_type);
 
+	if (msl_options.appgl_fp64_emulation)
+	{
+		if (op == GLSLstd450PackDouble2x32 && appgl_fp64_emulation_enabled_for_type(restype))
+		{
+			emit_unary_func_op(result_type, id, args[0], "appgl_df64_from_words2");
+			return;
+		}
+
+		if (op == GLSLstd450UnpackDouble2x32 && appgl_fp64_emulation_enabled_for_type(expression_type(args[0])))
+		{
+			emit_unary_func_op(result_type, id, args[0], "appgl_df64_words");
+			return;
+		}
+
+		if (appgl_fp64_emulation_enabled_for_type(restype))
+		{
+			switch (op)
+			{
+			case GLSLstd450Sqrt:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_sqrt");
+				return;
+			case GLSLstd450FAbs:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_abs");
+				return;
+			case GLSLstd450Floor:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_floor");
+				return;
+			case GLSLstd450Ceil:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_ceil");
+				return;
+			case GLSLstd450Round:
+			case GLSLstd450RoundEven:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_round");
+				return;
+			case GLSLstd450Trunc:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_trunc");
+				return;
+			case GLSLstd450FSign:
+				emit_unary_func_op(result_type, id, args[0], "appgl_df64_sign");
+				return;
+			case GLSLstd450FMin:
+			case GLSLstd450NMin:
+				emit_binary_func_op(result_type, id, args[0], args[1], "appgl_df64_min");
+				return;
+			case GLSLstd450FMax:
+			case GLSLstd450NMax:
+				emit_binary_func_op(result_type, id, args[0], args[1], "appgl_df64_max");
+				return;
+			case GLSLstd450FClamp:
+			case GLSLstd450NClamp:
+				emit_trinary_func_op(result_type, id, args[0], args[1], args[2], "appgl_df64_clamp");
+				return;
+			case GLSLstd450FMix:
+				emit_trinary_func_op(result_type, id, args[0], args[1], args[2], "appgl_df64_mix");
+				return;
+			default:
+				break;
+			}
+		}
+	}
+
 	// Only precise:: preserves NaN in trancendentals (supposedly, cannot find documentation for this).
 	const auto drop_nan_inf = FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask;
 	bool preserve_nan = (get_fp_fast_math_flags_for_op(result_type, id) & drop_nan_inf) != drop_nan_inf;
@@ -12339,11 +14576,19 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 				component = join(".", index_to_swizzle(c->scalar()));
 		}
 		// Like Direct3D, Metal puts the (0, 0) at the upper-left corner, not the center as SPIR-V and GLSL do.
-		// Offset the offset by (1/2 - 1/16), or 0.4375, to compensate for this.
-		// It has to be (1/2 - 1/16) and not 1/2, or several CTS tests subtly break on Intel.
+		// Offset the offset by 0.5 to compensate.
+		//
+		// Upstream uses (1/2 - 1/16) = 0.4375 (subpixel-1-unit bias) to dodge an Intel quirk
+		// where the maximum offset would otherwise overflow to the next pixel. On Apple Silicon
+		// (M1+), this bias breaks `interpolate_at_offset_check.*` tests that demand exact
+		// equality with the corresponding sample-rate varying — e.g.
+		// `interpolateAtOffset(v, gl_SamplePosition - 0.5)` should equal a `sample`-qualified
+		// varying read at the same sample, but the -1/16 bias displaces the read by 1/16 of a
+		// pixel and the comparison fails. CKPT125 (AppGL): use a clean 0.5 bias for the AppGL
+		// vendored SPIRV-Cross fork — Metal on Apple GPUs handles the boundary case correctly.
 		emit_op(result_type, id,
 		        join(to_name(stage_in_var_id), ".", to_member_name(get_stage_in_struct_type(), interface_index),
-		             ".interpolate_at_offset(", to_expression(args[1]), " + 0.4375)", component),
+		             ".interpolate_at_offset(", to_expression(args[1]), " + 0.5)", component),
 		        should_forward(args[0]) && should_forward(args[1]));
 		break;
 	}
@@ -13213,14 +15458,24 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 
 	// LOD Options
 	// Metal does not support LOD for 1D textures.
-	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+	// AppGL CKPT84: also skip for Dim::Rect — rectangle textures use
+	// unnormalized coordinates (sampler.normalizedCoordinates=NO, see
+	// GLContext.mm rebuildTextureSamplerState) which Metal forbids
+	// combining with bias()/level()/gradient() sample overloads
+	// ("These overloads are only valid if normalizedCoordinates
+	// property of the sampler is true"). Required by
+	// KHR-GL46.shading_language_420pack.binding_samplers_texture_type_2D_rectangle.
+	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D) &&
+	    imgtype.image.dim != DimRect)
 	{
 		forward = forward && should_forward(bias);
 		farg_str += ", bias(" + to_unpacked_expression(bias) + ")";
 	}
 
 	// Metal does not support LOD for 1D textures.
-	if (lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+	// AppGL CKPT84: also skip for Dim::Rect (see bias() comment above).
+	if (lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D) &&
+	    imgtype.image.dim != DimRect)
 	{
 		forward = forward && should_forward(lod);
 		if (args.base.is_fetch)
@@ -13299,7 +15554,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	}
 
 	// Metal does not support LOD for 1D textures.
-	if ((grad_x || grad_y) && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+	// AppGL CKPT84: also skip for Dim::Rect (gradient() incompatible with
+	// non-normalized coords; see bias() comment above).
+	if ((grad_x || grad_y) && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D) &&
+	    imgtype.image.dim != DimRect)
 	{
 		forward = forward && should_forward(grad_x);
 		forward = forward && should_forward(grad_y);
@@ -14214,8 +16472,20 @@ void CompilerMSL::emit_struct_member(const SPIRType &type, uint32_t member_type_
 	{
 		if (!has_active_builtin(builtin, StorageClassOutput) && !has_active_builtin(builtin, StorageClassInput))
 		{
-			// Do not emit unused builtins in mesh-output blocks
-			return;
+			// Do not emit unused builtins in mesh-output blocks.
+			// AppGL Path A++: exception for the GS-as-mesh main0_in
+			// struct — its builtins must be present for byte-stride
+			// parity with linked-VS main0_out, even when the GS body
+			// doesn't read them. Without this, gl_ClipDistance / etc.
+			// silently drop, VS writes 32B per vertex while mesh reads
+			// 24B per vertex, and subsequent vertices misalign.
+			const bool is_gs_as_mesh_main0_in =
+				msl_options.geometry_shader_as_mesh &&
+				get_execution_model() == ExecutionModelGeometry &&
+				stage_in_var_id &&
+				type.self == get_stage_in_struct_type().self;
+			if (!is_gs_as_mesh_main0_in)
+				return;
 		}
 	}
 
@@ -14282,7 +16552,13 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
 			return string(" [[attribute(") + convert_to_string(locn) + ")]]";
 	}
 
-	bool use_semantic_stage_output = is_mesh_shader() || is_tese_shader() ||
+	// AppGL fork: TES-as-compute captures output into a device buffer,
+	// so the "semantic stage output" path (which emits
+	// [[position]] / [[clip_distance]] / [[point_size]]) is wrong —
+	// those qualifiers are only valid on vertex-function output. Gate
+	// TES's participation on the compute form being off.
+	bool use_semantic_stage_output = is_mesh_shader() ||
+	                                 (is_tese_shader() && !msl_options.tess_evaluation_as_compute) ||
 	                                 (execution.model == ExecutionModelVertex && !msl_options.vertex_for_tessellation);
 
 	// Vertex, mesh and tessellation evaluation function outputs
@@ -14337,6 +16613,19 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
 		// output to a buffer. For this reason, qualifiers are irrelevant here.
 		if (is_builtin)
 			// We still have to assign a location so the output struct will sort correctly.
+			get_or_allocate_builtin_output_member_location(builtin, type.self, index);
+		return "";
+	}
+
+	// AppGL fork: TES-as-compute capture buffer. Pipeline-stage
+	// attributes like [[position]] / [[clip_distance]] / [[point_size]]
+	// are only valid on vertex-function output — they're rejected by
+	// the MSL compiler when the entry point is `kernel`. For the
+	// compute-form TES the struct just lives in a buffer, so drop
+	// every qualifier.
+	if (is_tese_shader() && msl_options.tess_evaluation_as_compute && type.storage == StorageClassOutput)
+	{
+		if (is_builtin)
 			get_or_allocate_builtin_output_member_location(builtin, type.self, index);
 		return "";
 	}
@@ -14742,6 +17031,12 @@ bool CompilerMSL::entry_point_returns_stage_output() const
 {
 	if (get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation)
 		return false;
+	// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute doesn't return
+	// its stage-out struct — the caller's TF-capture kernel writes output
+	// through a device buffer binding. Matches the vertex-for-tessellation
+	// sibling above.
+	if (get_execution_model() == ExecutionModelTessellationEvaluation && msl_options.tess_evaluation_as_compute)
+		return false;
 	bool ep_should_return_output = !get_is_rasterization_disabled();
 	return stage_out_var_id && ep_should_return_output;
 }
@@ -14777,9 +17072,24 @@ string CompilerMSL::func_type_decl(SPIRType &type)
 	case ExecutionModelTessellationEvaluation:
 		if (!msl_options.supports_msl_version(1, 2))
 			SPIRV_CROSS_THROW("Tessellation requires Metal 1.2.");
-		if (execution.flags.get(ExecutionModeIsolines))
+		// AppGL patch (phase-3B-metal-tess-TF isolines bypass): the
+		// "Metal does not support isoline tessellation." restriction
+		// applies to Metal's HW [[patch(...)]] vertex tessellation
+		// pipeline. When `tess_evaluation_as_compute` is set, the TES
+		// is emitted as a compute kernel that consumes domain coords
+		// from a host-supplied buffer (AppGL's `spvGenTessDomain`),
+		// bypassing Metal's HW tessellator entirely. The throw is
+		// gated on `!tess_evaluation_as_compute` so the kernel-form
+		// emission proceeds for isolines under our compute-emulation
+		// path; Metal HW restrictions are irrelevant in that mode.
+		if (execution.flags.get(ExecutionModeIsolines) && !msl_options.tess_evaluation_as_compute)
 			SPIRV_CROSS_THROW("Metal does not support isoline tessellation.");
-		if (msl_options.is_ios())
+		// AppGL patch (phase-3B-metal-tess-TF): emit TES as a compute
+		// kernel when `tess_evaluation_as_compute` is set. The caller
+		// supplies domain coords + a TF-capture buffer.
+		if (msl_options.tess_evaluation_as_compute)
+			entry_type = "kernel";
+		else if (msl_options.is_ios())
 			entry_type = join("[[ patch(", is_tessellating_triangles() ? "triangle" : "quad", ") ]] vertex");
 		else
 			entry_type = join("[[ patch(", is_tessellating_triangles() ? "triangle" : "quad", ", ",
@@ -14804,6 +17114,20 @@ string CompilerMSL::func_type_decl(SPIRType &type)
 	case ExecutionModelTaskEXT:
 		entry_type = "[[object]]";
 		break;
+	case ExecutionModelGeometry:
+		// AppGL fork (msl-geometry-shader-as-mesh.patch): under
+		// `geometry_shader_as_mesh`, GS source emits as Metal mesh
+		// shader form. Without the option set, no valid Metal entry
+		// type exists for GS source — fall through to `unknown` (the
+		// existing GS-as-MSL emission was already non-functional pre-
+		// patch, so this preserves the broken-by-design baseline).
+		if (msl_options.geometry_shader_as_mesh)
+		{
+			entry_type = "[[mesh]]";
+			break;
+		}
+		entry_type = "unknown";
+		break;
 	default:
 		entry_type = "unknown";
 		break;
@@ -14824,7 +17148,17 @@ bool CompilerMSL::is_tese_shader() const
 
 bool CompilerMSL::is_mesh_shader() const
 {
-	return get_execution_model() == ExecutionModelMeshEXT;
+	if (get_execution_model() == ExecutionModelMeshEXT)
+		return true;
+	// AppGL fork (msl-geometry-shader-as-mesh.patch): under
+	// `geometry_shader_as_mesh`, geometry-shader source SPIR-V emits as
+	// Metal mesh shader form. Threading the existing mesh-shader emission
+	// infrastructure (`emit_mesh_entry_point`, `add_meshlet_block`,
+	// `OpSetMeshOutputsEXT` handling, etc.) through this predicate is
+	// the cheapest route to reusing it for GS source.
+	if (msl_options.geometry_shader_as_mesh && get_execution_model() == ExecutionModelGeometry)
+		return true;
+	return false;
 }
 
 bool CompilerMSL::uses_explicit_early_fragment_test()
@@ -15039,7 +17373,9 @@ string CompilerMSL::entry_point_arg_stage_in()
 	string decl;
 
 	if ((is_tesc_shader() && msl_options.multi_patch_workgroup) ||
-	    (is_tese_shader() && msl_options.raw_buffer_tese_input))
+	    (is_tese_shader() && msl_options.raw_buffer_tese_input) ||
+	    (msl_options.geometry_shader_as_mesh &&
+	     get_execution_model() == ExecutionModelGeometry))
 		return decl;
 
 	// Stage-in structure
@@ -15065,6 +17401,24 @@ string CompilerMSL::entry_point_arg_stage_in()
 // and false for builtins that should be passed or calculated some other way.
 bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
 {
+	// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute doesn't expose
+	// Metal's tess intrinsics as entry-point args — the
+	// `[[position_in_patch]]` / `[[patch_id]]` qualifiers are illegal on
+	// compute kernels. gl_TessCoord and gl_PrimitiveID are instead
+	// seeded in the entry prologue from a host-supplied domain-coord
+	// buffer keyed by `[[thread_position_in_grid]]`.
+	if (get_execution_model() == ExecutionModelTessellationEvaluation &&
+	    msl_options.tess_evaluation_as_compute)
+	{
+		switch (bi_type)
+		{
+		case BuiltInTessCoord:
+		case BuiltInPrimitiveId:
+			return false;
+		default:
+			break;
+		}
+	}
 	switch (bi_type)
 	{
 	// Vertex function in
@@ -15210,7 +17564,14 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 			if (!ep_args.empty())
 				ep_args += ", ";
 
-			ep_args += type_to_glsl(get_variable_data_type(var)) + " " + to_expression(var_id) + " [[grid_size]]";
+			// Path G: `[[grid_size]]` is the threadgroup-grid dimensions
+			// (which on Apple Silicon returns `(0,0,0)` for these
+			// kernel signatures, causing every thread to early-return).
+			// `[[threads_per_grid]]` is the actual thread count.
+			const char *attr =
+				msl_options.force_threads_per_grid_for_stage_input_size
+				    ? "[[threads_per_grid]]" : "[[grid_size]]";
+			ep_args += type_to_glsl(get_variable_data_type(var)) + " " + to_expression(var_id) + " " + attr;
 		}
 	});
 
@@ -15235,8 +17596,30 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 		{
 			if (!ep_args.empty())
 				ep_args += ", ";
-			ep_args += join("device ", type_to_glsl(get_stage_out_struct_type()), "* ", output_buffer_var_name,
+			// Path E++: prefix `volatile` on the spvOut buffer parameter
+			// when the cross-encoder-family flag is set. Apple's MSL spec
+			// requires AIR to preserve writes through volatile-qualified
+			// pointers; this is the load-bearing primitive that defeats
+			// AIR's cross-encoder-family elimination class.
+			const char *vol_pfx =
+				msl_options.force_compute_kernel_device_volatile_writes ? "volatile " : "";
+			ep_args += join(vol_pfx, "device ", type_to_glsl(get_stage_out_struct_type()), "* ", output_buffer_var_name,
 			                " [[buffer(", msl_options.shader_output_buffer_index, ")]]");
+		}
+
+		// Path E+++ diagnostic: entry-counter probe. Adds a
+		// `device atomic_uint* spvKernelEntryCounter [[buffer(N)]]`
+		// parameter that the kernel preamble atomically increments.
+		// Definitively answers "did the kernel body execute" when
+		// downstream readback fails on the main output buffer.
+		if (msl_options.force_compute_kernel_entry_counter_probe &&
+		    get_execution_model() == ExecutionModelVertex &&
+		    msl_options.vertex_for_tessellation)
+		{
+			if (!ep_args.empty())
+				ep_args += ", ";
+			ep_args += join("device atomic_uint* spvKernelEntryCounter [[buffer(",
+			                msl_options.entry_counter_buffer_index, ")]]");
 		}
 
 		if (is_tesc_shader())
@@ -15253,6 +17636,25 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 				ep_args += ", ";
 			ep_args +=
 			    join("device uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
+		}
+
+		// AppGL patch (phase-3B-metal-tess-TF): inject domain-coord buffer args
+		// for TES-as-compute. The caller (AppGL encoder) writes pre-tessellated
+		// (gl_TessCoord, gl_PrimitiveID) pairs into two buffers and dispatches
+		// one kernel thread per output vertex. The per-thread read happens in
+		// fixup_hooks_in for BuiltInTessCoord / BuiltInPrimitiveId (see below).
+		//
+		// Buffer slots 24 + 25 are chosen to sit just below the tess
+		// infrastructure slots (26-29) and above the stage-in inputs (20-22).
+		// If an AppGL argument-buffer mode collides with these, the tess-TF
+		// path stays off (different programs, different encoders).
+		if (get_execution_model() == ExecutionModelTessellationEvaluation &&
+		    msl_options.tess_evaluation_as_compute)
+		{
+			if (!ep_args.empty())
+				ep_args += ", ";
+			ep_args += "const device packed_float3* spvDomainTessCoord [[buffer(25)]]";
+			ep_args += ", const device uint* spvDomainPrimID [[buffer(24)]]";
 		}
 
 		if (get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation &&
@@ -15295,6 +17697,20 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 				ep_args += ", ";
 			ep_args += join("device ", get_tess_factor_struct_name(), "* ", tess_factor_buffer_var_name, " [[buffer(",
 			                convert_to_string(msl_options.shader_tess_factor_buffer_index), ")]]");
+
+			// Path L extension: dual-write requires the full-precision
+			// shadow buffer parameter on TCS-compute as well as on
+			// TES-compute. Same slot for read/write coherence; AppGL-W's
+			// runtime binds the buffer at the documented slot for both
+			// kernels in the same pipeline cycle.
+			if (msl_options.use_full_precision_tess_level_buffer)
+			{
+				ep_args += ", ";
+				ep_args += join("device float* spvTessLevelFull",
+				                " [[buffer(",
+				                convert_to_string(msl_options.shader_tess_factor_buffer_full_index),
+				                ")]]");
+			}
 
 			// Initializer for tess factors must be handled specially since it's never declared as a normal variable.
 			uint32_t outer_factor_initializer_id = 0;
@@ -15386,6 +17802,21 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 				ep_args += ", ";
 			ep_args += join("const device ", get_tess_factor_struct_name(), "* ", tess_factor_buffer_var_name,
 			                " [[buffer(", convert_to_string(msl_options.shader_tess_factor_buffer_index), ")]]");
+
+			// Path L: ALSO add the full-precision shadow buffer when
+			// flag is on. The half-precision parameter remains in the
+			// signature (preserves AppGL/MoltenVK runtime parameter-binding
+			// compatibility for callers that haven't migrated); reads in
+			// add_tess_level_input redirect to the full-precision buffer
+			// when the flag is on.
+			if (msl_options.use_full_precision_tess_level_buffer)
+			{
+				ep_args += ", ";
+				ep_args += join("const device float* spvTessLevelFull",
+				                " [[buffer(",
+				                convert_to_string(msl_options.shader_tess_factor_buffer_full_index),
+				                ")]]");
+			}
 		}
 
 		if (stage_in_var_id)
@@ -15399,6 +17830,26 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 
 	if (is_mesh_shader())
 	{
+		// GS-as-mesh: replace `[[stage_in]]` with a device-buffer-typed
+		// VS-output parameter (one main0_in entry per linked-VS output
+		// vertex) plus a threadgroup-position parameter that gives the
+		// current GS primitive index. The runtime dispatches one mesh
+		// threadgroup per input primitive, so [[threadgroup_position_in_grid]]
+		// is the natural source for `gl_PrimitiveIDIn`-equivalent indexing
+		// into the VS-output buffer.
+		if (msl_options.geometry_shader_as_mesh &&
+		    get_execution_model() == ExecutionModelGeometry &&
+		    stage_in_var_id)
+		{
+			if (!ep_args.empty())
+				ep_args += ", ";
+			ep_args += join("const device ", type_to_glsl(get_stage_in_struct_type()),
+			                "* spvVsOutputs [[buffer(",
+			                convert_to_string(msl_options.shader_input_buffer_index), ")]]");
+			if (!ep_args.empty())
+				ep_args += ", ";
+			ep_args += "uint spvPrimitiveID [[threadgroup_position_in_grid]]";
+		}
 		if (!ep_args.empty())
 			ep_args += ", ";
 		ep_args += join("spvMesh_t spvMesh");
@@ -15840,14 +18291,370 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 			          " >= ", to_expression(builtin_stage_input_size_id), "))");
 			statement("    return;");
 		});
+
+		// Path E+++ diagnostic — entry-counter probe.
+		// Increments a device atomic_uint at kernel preamble. AppGL-W's
+		// readback of the counter buffer post-dispatch confirms whether
+		// the kernel body actually executed (counter > 0) or the dispatch
+		// was issued but the kernel body skipped (counter == 0). The
+		// distinction routes between AIR-elimination escalation
+		// (kernel runs, writes lost) and a different-layer issue
+		// (kernel doesn't run; binding/encoder/resource problem).
+		if (msl_options.force_compute_kernel_entry_counter_probe)
+		{
+			entry_func.fixup_hooks_in.push_back([this]() {
+				statement("atomic_fetch_add_explicit(spvKernelEntryCounter, 1u, "
+				          "memory_order_relaxed);");
+			});
+		}
+
+		// Path E+++ — atomic_store on spvOut writes.
+		// Walks main0_out's members at kernel exit and emits per-scalar
+		// `atomic_store_explicit` re-stores. Each atomic_store is
+		// contractually non-eliminable per Apple's MSL spec; combined
+		// with the load required to compute the stored value (which
+		// reads through the prior write), this transitively forces the
+		// regular non-atomic writes to be preserved. memory_order_relaxed
+		// keeps the per-write overhead low. Decomposes vec/array types
+		// into per-component scalar atomic stores via component
+		// indexing on the spvOut struct.
+		if (msl_options.force_compute_kernel_atomic_writes_on_spvOut)
+		{
+			entry_func.fixup_hooks_out.push_back([this]() {
+				if (!stage_out_var_id)
+					return;
+				auto &out_type = get_stage_out_struct_type();
+				const std::string &out_ref = stage_out_var_name;
+				// Address-of on vector components (`&out.v.x`) is
+				// disallowed in MSL, and `spvUnsafeArray` lacks a
+				// `volatile device` operator[] overload. Bypass both
+				// restrictions by taking the address of the whole
+				// vec/array container, casting to a raw uint pointer,
+				// and indexing by uint slot — works uniformly across
+				// volatile and non-volatile contexts because raw
+				// pointer arithmetic doesn't dispatch through any
+				// operator overload. Each uint slot corresponds to
+				// one 4-byte scalar element of the underlying type.
+				auto emit_atomic_via_container = [&](
+				    const std::string &container_path, uint32_t uint_index) {
+					statement("atomic_store_explicit(",
+					          "&((device atomic_uint*)&", out_ref, ".", container_path, ")[", uint_index, "], ",
+					          "((device uint*)&", out_ref, ".", container_path, ")[", uint_index, "], ",
+					          "memory_order_relaxed);");
+				};
+				auto emit_atomic_scalar_direct = [&](const std::string &field_path) {
+					statement("atomic_store_explicit(",
+					          "(device atomic_uint*)&", out_ref, ".", field_path, ", ",
+					          "*(device uint*)&", out_ref, ".", field_path, ", ",
+					          "memory_order_relaxed);");
+				};
+				for (uint32_t m = 0; m < uint32_t(out_type.member_types.size()); ++m)
+				{
+					auto &mbr_type = get<SPIRType>(out_type.member_types[m]);
+					std::string mbr_name = to_member_name(out_type, m);
+					if (!mbr_type.array.empty())
+					{
+						uint32_t elems = mbr_type.array.front();
+						uint32_t vec = mbr_type.vecsize;
+						uint32_t total_uints = elems * (vec > 0 ? vec : 1);
+						for (uint32_t i = 0; i < total_uints; ++i)
+							emit_atomic_via_container(mbr_name, i);
+					}
+					else if (mbr_type.vecsize > 1)
+					{
+						for (uint32_t v = 0; v < mbr_type.vecsize; ++v)
+							emit_atomic_via_container(mbr_name, v);
+					}
+					else
+					{
+						emit_atomic_scalar_direct(mbr_name);
+					}
+				}
+			});
+		}
+
+		// Path E (gate 9) — cross-encoder-family AIR liveness.
+		// AppGL-W's Phase 2 Checkpoint 9-10 diagnostic confirmed
+		// VS-compute writes to `device main0_out* spvOut [[buffer(28)]]`
+		// survive on compute→compute consumer paths (Phase-3 metal-tess
+		// VS→TCS) but silently vanish on compute→render consumer paths
+		// (mesh-GS Phase 2 VS→mesh function). Same MSL, same dispatch,
+		// same buffer slot — only consumer encoder family differs.
+		// Apple's AIR optimizer + Metal driver appear to eliminate the
+		// writes across the encoder boundary in the absence of an
+		// explicit memory ordering signal at kernel exit.
+		//
+		// Mitigation: emit `threadgroup_barrier(mem_flags::mem_device)`
+		// at function exit, gated by the new
+		// `force_compute_kernel_device_barrier_at_exit` flag. Default off
+		// preserves byte-identical emission for tess→tess. AppGL-W's
+		// runtime enables for VS-compute targeting mesh-pipeline
+		// consumption (the compute→render boundary case).
+		if (msl_options.force_compute_kernel_device_barrier_at_exit)
+		{
+			entry_func.fixup_hooks_out.push_back([this]() {
+				statement("threadgroup_barrier(mem_flags::mem_device);");
+			});
+		}
 	}
 
 	if (is_mesh_shader())
 	{
-		// If shader doesn't call SetMeshOutputsEXT, nothing should be rendered.
-		// No need to barrier after this, because only thread 0 writes to this later.
-		entry_func.fixup_hooks_in.push_back([this]() { statement("if (gl_LocalInvocationIndex == 0) spvMeshSizes.y = 0u;"); });
-		entry_func.fixup_hooks_out.push_back([this]() { emit_mesh_outputs(); });
+		// AppGL fork (msl-geometry-shader-as-mesh.patch): GS-as-mesh
+		// uses a different trailing emit and entry-state setup than
+		// mesh-source SPIR-V. Differentiate here.
+		const bool gs_as_mesh = msl_options.geometry_shader_as_mesh &&
+		                        get_execution_model() == ExecutionModelGeometry;
+
+		if (gs_as_mesh)
+		{
+			// Counters + function-local output arrays for GS-as-mesh.
+			// spvVertices captures per-vertex outputs (EmitVertex sites);
+			// spvCurrentPrim captures per-primitive outputs (latched until
+			// EndPrimitive flushes to spvMesh). Both are function-scope,
+			// not threadgroup, because GS-as-mesh maps each GS invocation
+			// to one mesh threadgroup with a single thread.
+			//
+			// Component 6: input declarations — GS source code references
+			// per-input-vertex `gl_in[]` (implicit gl_PerVertex array) and
+			// any `in <type> name[];` user varyings declared at top level.
+			// Mesh shaders consume inputs via `[[payload]]` populated by an
+			// optional object stage; without an object stage this Step 2
+			// MVP zero-initializes the locals so MSL compiles cleanly.
+			// Real per-input-vertex data flow is a future-sprint integration
+			// (object stage that loads VS-output into payload).
+			entry_func.fixup_hooks_in.push_back([this]() {
+				auto &execution = get_entry_point();
+				statement("uint spvVertexIndex = 0u;");
+				statement("uint spvPrimitiveIndex = 0u;");
+				// Path H: track whether the current GS run owes an
+				// implicit EndPrimitive at function exit (per GL 4.6
+				// §11.3.4). Set to true on each OpEmitVertex; cleared
+				// on each OpEndPrimitive. At function exit, if true,
+				// the trailing emit replays the EndPrimitive index/
+				// primitive flush sequence.
+				statement("bool spvNeedImplicitEndPrimitive = false;");
+				// Phase 2.5 Gap B: track the spvVertexIndex value at the
+				// start of the current strip so the strip-to-list
+				// expansion in emit_gs_as_mesh_endprimitive can compute
+				// per-strip indices correctly. Updated to spvVertexIndex
+				// at the end of each EndPrimitive flush.
+				statement("uint spvStripStart = 0u;");
+				statement("spvUnsafeArray<spvPerVertex, ", execution.output_vertices, "> spvVertices = {};");
+				if (mesh_out_per_primitive != 0)
+				{
+					statement("spvPerPrimitive spvCurrentPrim = {};");
+					// Phase 2.5 Gap C: declare function-local shadows of
+					// each per-primitive Output (gl_Layer, gl_ViewportIndex,
+					// gl_PrimitiveID — anything that landed in spvPerPrimitive
+					// via PerPrimitiveEXT decoration synthesis). GLSL GS
+					// source pattern for layered_rendering tests:
+					//   gl_Layer = i;         // OpStore — intercepted, see
+					//                         // OpStore handler below
+					//   layer_id = gl_Layer;  // OpLoad — emits bare
+					//                         // `gl_Layer` identifier
+					// Without function-local shadows, the read emits
+					// undeclared-identifier error at metal -c. With shadows,
+					// reads resolve naturally; OpStore intercept is updated
+					// to write to BOTH the shadow AND spvCurrentPrim so
+					// EndPrimitive flushes still see the latest value.
+					auto &pp_type = get<SPIRType>(mesh_out_per_primitive);
+					for (uint32_t m = 0; m < uint32_t(pp_type.member_types.size()); ++m)
+					{
+						auto &mbr_type = get<SPIRType>(pp_type.member_types[m]);
+						std::string mbr_name = to_member_name(pp_type, m);
+						statement(type_to_glsl(mbr_type), " ", mbr_name, " = {};");
+					}
+				}
+				// Pass 1 declarations + Path A population state.
+				uint32_t verticesPerPrim = 0;
+				SmallVector<SPIRVariable *> input_vars;
+				// Declare locals for each input variable. Walks the IR's
+				// Input-storage-class variables and emits a
+				// `spvUnsafeArray<ELEMENT_TYPE, N> NAME;` for arrayed
+				// inputs (the typical GS shape: `gl_in[]`, `in_color[]`)
+				// or `ELEMENT_TYPE NAME = {};` for scalars. Pass 2 then
+				// populates each from the linked-VS output buffer.
+				//
+				// Uses `get_variable_data_type` to peel the StorageClassInput
+				// pointer (avoiding `type_to_glsl`'s `thread T *` decoration)
+				// and `get_variable_element_type` to peel both pointer and
+				// array, so `type_to_glsl` returns the bare element-type name
+				// suitable as a `spvUnsafeArray` template parameter.
+				ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+					if (var.storage != StorageClassInput)
+						return;
+					const auto &data_type = get_variable_data_type(var);
+					const bool is_block = has_decoration(data_type.self, DecorationBlock) ||
+					                      (!data_type.array.empty() &&
+					                       has_decoration(get<SPIRType>(data_type.parent_type).self,
+					                                      DecorationBlock));
+					// Skip pure builtins (e.g. gl_PrimitiveIDIn) since they
+					// have dedicated emission paths; gl_in (a builtin block
+					// variable) is *not* skipped — the body references it
+					// directly and needs a function-local declaration.
+					if (is_builtin_variable(var) && !is_block)
+						return;
+					const std::string &name = get_name(var.self);
+					if (name.empty())
+						return;
+					const auto &element_type = get_variable_element_type(var);
+					std::string type_str = type_to_glsl(element_type);
+					if (!data_type.array.empty())
+					{
+						uint32_t array_size = data_type.array.front();
+						statement("spvUnsafeArray<", type_str, ", ", array_size, "> ", name, ";");
+						if (verticesPerPrim == 0)
+							verticesPerPrim = array_size;
+					}
+					else
+					{
+						statement(type_str, " ", name, " = {};");
+					}
+					input_vars.push_back(&var);
+				});
+
+				// Path A: populate function-local input arrays from
+				// `spvVsOutputs[spvPrimitiveID * verticesPerPrim + i]`.
+				// main0_in is built earlier with strip_array=true so its
+				// members are per-vertex (matching linked-VS output struct
+				// shape). gl_PerVertex block inputs (gl_in) get per-builtin-
+				// member copy; user varyings get a single per-vertex copy.
+				if (stage_in_var_id && verticesPerPrim > 0)
+				{
+					statement("for (uint spvVI = 0u; spvVI < ", verticesPerPrim, "u; ++spvVI)");
+					begin_scope();
+					statement("const device main0_in& spvVsIn = spvVsOutputs[spvPrimitiveID * ",
+					          verticesPerPrim, "u + spvVI];");
+					auto &main0_in_type = get_stage_in_struct_type();
+					// member_present: filter against the EMITTED struct shape.
+					// SPIR-V IR carries gl_PerVertex with all 4 builtins
+					// (Position/PointSize/ClipDist/CullDist) but emission
+					// drops inactive ones — has_active_builtin is the
+					// authoritative "this member made it into main0_in"
+					// signal for builtins. User varyings are matched by
+					// their declared name in main0_in_type.
+					auto member_present_user_name = [&](const std::string &mbr_name) {
+						for (uint32_t i = 0; i < uint32_t(main0_in_type.member_types.size()); ++i)
+							if (to_member_name(main0_in_type, i) == mbr_name)
+								return true;
+						return false;
+					};
+					auto member_present_builtin = [&](BuiltIn bi) {
+						return has_active_builtin(bi, StorageClassInput);
+					};
+					for (auto *p_var : input_vars)
+					{
+						auto &var = *p_var;
+						const auto &data_type = get_variable_data_type(var);
+						if (data_type.array.empty())
+							continue;
+						const bool is_block =
+							has_decoration(data_type.self, DecorationBlock) ||
+							(!data_type.array.empty() &&
+							 has_decoration(get<SPIRType>(data_type.parent_type).self,
+							                DecorationBlock));
+						const std::string &name = get_name(var.self);
+						if (is_block)
+						{
+							const auto &element_type = get_variable_element_type(var);
+							for (uint32_t m = 0;
+							     m < uint32_t(element_type.member_types.size()); ++m)
+							{
+								BuiltIn bi = BuiltInMax;
+								if (is_member_builtin(element_type, m, &bi))
+								{
+									// Builtin block member (gl_Position, gl_PointSize,
+									// etc.) — main0_in field name == builtin name.
+									if (!member_present_builtin(bi))
+										continue;
+									std::string mbr_name = builtin_to_glsl(bi, StorageClassInput);
+									statement(name, "[spvVI].", mbr_name,
+									          " = spvVsIn.", mbr_name, ";");
+								}
+								else
+								{
+									// Path I: user-defined interface-block member
+									// (e.g. `in VS_GS { vec4 v1; vec4 v2; } iface[];`
+									// → block_mbr_name = "v1", main0_in field name =
+									// "<var_name>_<block_mbr_name>" = "iface_v1").
+									// Without this branch, the function-local
+									// `iface[i].v1` would read from an
+									// uninitialized/zero-init array — body sees garbage,
+									// rasterization produces zero output despite clean
+									// xcrun + clean dispatch.
+									std::string block_mbr_name = to_member_name(element_type, m);
+									std::string main0_in_field = name + "_" + block_mbr_name;
+									if (!member_present_user_name(main0_in_field))
+										continue;
+									statement(name, "[spvVI].", block_mbr_name,
+									          " = spvVsIn.", main0_in_field, ";");
+								}
+							}
+						}
+						else
+						{
+							if (!member_present_user_name(name))
+								continue;
+							statement(name, "[spvVI] = spvVsIn.", name, ";");
+						}
+					}
+					end_scope();
+				}
+			});
+			entry_func.fixup_hooks_out.push_back([this]() {
+				// Path H — implicit EndPrimitive at function exit (GL 4.6 §11.3.4).
+				// If vertices were emitted since the last explicit
+				// EndPrimitive (or no EndPrimitive ever called), flush the
+				// trailing primitive(s) before set_primitive_count locks
+				// in the count. Mirrors the OpEndPrimitive emit shape per
+				// output topology — only fires when the runtime flag
+				// indicates an unflushed run is owed.
+				statement("if (spvNeedImplicitEndPrimitive)");
+				begin_scope();
+				// Path H + Gap B: same emission shape as OpEndPrimitive.
+				emit_gs_as_mesh_endprimitive();
+				end_scope();
+
+				// Trailing emit: copy local arrays into spvMesh outputs.
+				// Distinct from emit_mesh_outputs (which assumes
+				// mesh-source IR shape with array-typed output globals).
+				statement("spvMesh.set_primitive_count(spvPrimitiveIndex);");
+				statement("for (uint spvVI = 0u; spvVI < spvVertexIndex; ++spvVI)");
+				begin_scope();
+				// Path B (gate 8) — emit_fixup() side-effects for the
+				// GS-as-mesh path. The legacy `emit_fixup()` short-circuits
+				// when `capture_output_to_buffer == true` (set by VS-compute
+				// via vertex_for_tessellation), assuming a downstream vertex
+				// stage will re-apply these transforms. Mesh-GS has no such
+				// downstream stage — the mesh function IS the last vertex
+				// stage before rasterization. Replicate each of emit_fixup's
+				// three conditional transformations here, gated by the same
+				// option flags it consults, applied to each vertex's
+				// `spvVertices[spvVI]` before `spvMesh.set_vertex` flushes
+				// it to the rasterizer.
+				if (needs_point_size_output && !writes_to_point_size)
+					statement("spvVertices[spvVI].gl_PointSize = ",
+					          format_float(msl_options.default_point_size), ";");
+				if (options.vertex.fixup_clipspace)
+					statement("spvVertices[spvVI].gl_Position.z = "
+					          "(spvVertices[spvVI].gl_Position.z + "
+					          "spvVertices[spvVI].gl_Position.w) * 0.5;");
+				if (options.vertex.flip_vert_y)
+					statement("spvVertices[spvVI].gl_Position.y = "
+					          "-(spvVertices[spvVI].gl_Position.y);");
+				statement("spvMesh.set_vertex(spvVI, spvVertices[spvVI]);");
+				end_scope();
+			});
+		}
+		else
+		{
+			// Mesh-source SPIR-V path — existing behaviour.
+			// If shader doesn't call SetMeshOutputsEXT, nothing should be rendered.
+			// No need to barrier after this, because only thread 0 writes to this later.
+			entry_func.fixup_hooks_in.push_back([this]() { statement("if (gl_LocalInvocationIndex == 0) spvMeshSizes.y = 0u;"); });
+			entry_func.fixup_hooks_out.push_back([this]() { emit_mesh_outputs(); });
+		}
 	}
 
 	// Look for sampled images and buffer. Add hooks to set up the swizzle constants or array lengths.
@@ -15968,6 +18775,21 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 			case BuiltInPrimitiveId:
 				// This is natively supported by fragment and tessellation evaluation shaders.
 				// In tessellation control shaders, this is direct-mapped without multi-patch workgroups.
+				// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute reads
+				// gl_PrimitiveID from `spvDomainPrimID [[buffer(24)]]`.
+				// Insert at front so other hooks (like the gl_in per-CP
+				// buffer indexing under raw_buffer_tese_input) can
+				// reference gl_PrimitiveID when they run.
+				if (is_tese_shader() && msl_options.tess_evaluation_as_compute)
+				{
+					string pid_name = to_expression(var_id);
+					entry_func.fixup_hooks_in.insert(
+						entry_func.fixup_hooks_in.begin(), [=]() {
+							statement("uint ", pid_name, " = spvDomainPrimID[",
+							          to_expression(builtin_invocation_id_id), ".x];");
+						});
+					break;
+				}
 				if (!is_tesc_shader() || !msl_options.multi_patch_workgroup)
 					break;
 
@@ -15982,10 +18804,33 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				{
 					if (msl_options.raw_buffer_tese_input)
 					{
+						// Path K (Phase 1 sub-cluster A): TES-as-compute
+						// reads gl_PatchVerticesIn from spvIndirectParams[0]
+						// — the runtime indirect-parameters buffer slot 0,
+						// populated by the host with the linked TCS's
+						// `layout(vertices = N) out;` value at dispatch
+						// time.
+						//
+						// The prior literal `get_entry_point().output_vertices`
+						// returned 0 for TES SPIR-V (output_vertices is the
+						// TCS-side declaration, not encoded on the TES side
+						// of the link), causing every gl_PatchVerticesIn read
+						// to evaluate to 0 — universal bounds-check failure
+						// class for any TES that branches on the value.
+						//
+						// Compile-time override path: if
+						// `msl_options.tese_input_patch_vertices` is set
+						// non-zero, emit it as a literal (AppGL fork compile-
+						// time override per Sprint 1). Default 0 means use
+						// the runtime read.
 						entry_func.fixup_hooks_in.push_back(
 						    [=]() {
-							    statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
-							              get_entry_point().output_vertices, ";");
+							    if (msl_options.tese_input_patch_vertices != 0)
+								    statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = ",
+								              msl_options.tese_input_patch_vertices, ";");
+							    else
+								    statement(builtin_type_decl(bi_type), " ", to_expression(var_id),
+								              " = spvIndirectParams[0];");
 						    });
 					}
 					else
@@ -16006,6 +18851,27 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				}
 				break;
 			case BuiltInTessCoord:
+				// AppGL patch (phase-3B-metal-tess-TF): TES-as-compute
+				// reads gl_TessCoord from `spvDomainTessCoord [[buffer(25)]]`
+				// indexed by `[[thread_position_in_grid]].x`. Caller
+				// supplies coords already compensated for winding /
+				// spacing / domain origin — no per-thread fixup.
+				// Insert at the FRONT of fixup_hooks_in: the
+				// `raw_buffer_tese_input` per-CP-array hook references
+				// `gl_PrimitiveID`, and we need the domain-buffer reads
+				// to execute before any of SPIRV-Cross's own input hooks.
+				if (is_tese_shader() && msl_options.tess_evaluation_as_compute)
+				{
+					string tc_name = to_expression(var_id);
+					entry_func.fixup_hooks_in.insert(
+						entry_func.fixup_hooks_in.begin(), [=]() {
+							statement("float3 ", tc_name,
+							          " = float3(spvDomainTessCoord[",
+							          to_expression(builtin_invocation_id_id), ".x]);");
+						});
+					break;  // skip the quad-padding + domain-origin fixups;
+					        // the compute caller supplies coords in final form.
+				}
 				if (get_entry_point().flags.get(ExecutionModeQuads))
 				{
 					// The entry point will only have a float2 TessCoord variable.
@@ -17346,6 +20212,7 @@ string CompilerMSL::to_qualifiers_glsl(uint32_t id)
 string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 {
 	string type_name;
+	bool appgl_fp64_lowered_type = false;
 
 	// Pointer?
 	if (is_pointer(type) || type_is_array_of_pointers(type))
@@ -17551,7 +20418,13 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 		type_name = "float";
 		break;
 	case SPIRType::Double:
-		type_name = "double"; // Currently unsupported
+		if (msl_options.appgl_fp64_emulation)
+		{
+			type_name = appgl_fp64_msl_type_name(type);
+			appgl_fp64_lowered_type = true;
+		}
+		else
+			type_name = "double"; // Currently unsupported
 		break;
 	case SPIRType::BFloat16:
 		if (!msl_options.supports_msl_version(3, 1))
@@ -17576,7 +20449,7 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 	}
 
 	// Matrix?
-	if (type.columns > 1)
+	if (!appgl_fp64_lowered_type && type.columns > 1)
 	{
 		auto *var = maybe_get_backing_variable(id);
 		if (var && var->basevariable)
@@ -17597,7 +20470,7 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 	}
 
 	// Vector or Matrix?
-	if (type.vecsize > 1)
+	if (!appgl_fp64_lowered_type && type.vecsize > 1)
 		type_name += to_string(type.vecsize);
 
 	if (type.array.empty() || using_builtin_array())
@@ -17669,6 +20542,33 @@ string CompilerMSL::constant_op_expression(const SPIRConstantOp &cop)
 	default:
 		return CompilerGLSL::constant_op_expression(cop);
 	}
+}
+
+string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint32_t vector)
+{
+	auto type = get<SPIRType>(c.constant_type);
+	type.columns = 1;
+
+	if (!appgl_fp64_emulation_enabled_for_type(type))
+		return CompilerGLSL::constant_expression_vector(c, vector);
+
+	if (type.vecsize == 1)
+		return appgl_fp64_constant_component(c, vector, 0);
+
+	string res = appgl_fp64_msl_type_name(type);
+	res += "(";
+	for (uint32_t i = 0; i < c.vector_size(); i++)
+	{
+		if (i)
+			res += ", ";
+
+		if (c.specialization_constant_id(vector, i) != 0)
+			res += to_expression(c.specialization_constant_id(vector, i));
+		else
+			res += appgl_fp64_constant_component(c, vector, i);
+	}
+	res += ")";
+	return res;
 }
 
 bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable, StorageClass storage) const
@@ -17936,6 +20836,18 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 			else
 				img_type_name += (img_type.arrayed ? "texture2d_array" : "texturecube");
 			break;
+		// AppGL CKPT82: Metal has no rectangle texture type — both
+		// GL `sampler2DRect` and a regular `sampler2D` map to the same
+		// MSL `texture2d<T>` underlying object (the only runtime
+		// difference is normalized vs unnormalized coords, handled
+		// via the sampler's `coord::pixel` mode). Without this case
+		// the SPIR-V `Dim` of `Rect` fell through to `default:` and
+		// emitted `unknown_texture_type<T>`, an invalid MSL token
+		// that silently failed pipeline build. Required by
+		// KHR-GL46.shading_language_420pack.binding_samplers_texture_type_2D_rectangle.
+		case DimRect:
+			img_type_name += "texture2d";
+			break;
 		default:
 			img_type_name += "unknown_texture_type";
 			break;
@@ -17981,6 +20893,25 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 					img_type_name += "read_";
 
 				img_type_name += "write";
+			}
+			else if (p_var && has_decoration(p_var->self, DecorationNonWritable) &&
+			         !has_decoration(p_var->self, DecorationNonReadable))
+			{
+				// [appgl-local] emit `access::read` for readonly
+				// storage images (GLSL `readonly image2D`). Upstream
+				// defaults to no qualifier (â `access::sample` in
+				// MSL), which Metal's MTLArgumentEncoder doesn't
+				// expose as an argument-buffer slot without a paired
+				// sampler â breaks readonly-storage-image argbuf
+				// bindings on `compute_shader.pipeline-post-fs`.
+				// `access::read` is the correct type for a
+				// .read()-only storage image in an argument buffer.
+				// NOTE: `access::read` alone doesn't work — Metal's
+				// MTLArgumentEncoder seems to require a writable
+				// qualifier for argument-buffer slot reflection.
+				// Emit `access::read_write`; the shader body only
+				// calls .read() so the write capability is unused.
+				img_type_name += ", access::read_write";
 			}
 			else
 			{
@@ -19331,7 +22262,16 @@ uint32_t CompilerMSL::get_declared_type_alignment_msl(TypeID type_id, const SPIR
 		SPIRV_CROSS_THROW("Querying alignment of opaque object.");
 
 	case SPIRType::Double:
-		SPIRV_CROSS_THROW("double types are not supported in buffers in MSL.");
+		if (msl_options.appgl_fp64_emulation)
+		{
+			if (is_packed)
+				return 8;
+
+			uint32_t vecsize = (row_major && type.columns > 1) ? type.columns : type.vecsize;
+			return 8 * (vecsize == 3 ? 4 : vecsize);
+		}
+		else
+			SPIRV_CROSS_THROW("double types are not supported in buffers in MSL.");
 
 	case SPIRType::Struct:
 	{
@@ -19392,6 +22332,138 @@ void CompilerMSL::analyze_sampled_image_usage()
 		SampledImageScanner scanner(*this);
 		traverse_all_reachable_opcodes(get<SPIRFunction>(ir.default_entry_point), scanner);
 	}
+}
+
+// AppGL fork (msl-tcs-output-classification.patch).
+// See spirv_msl.hpp `split_tcs_outputs_by_consumption` for context.
+//
+// Walks the SPIR-V module's TCS user-varying outputs and partitions them
+// into two classes:
+//  * TES-consumed — at least one location in `outputs_by_location` (or
+//    builtin in `outputs_by_builtin`) matches. Left untouched; will land
+//    in main0_out / the per-CP device buffer.
+//  * TCS-internal — no match in the API-set maps. Marked masked via
+//    `mask_stage_output_by_location`. The existing
+//    `is_stage_output_variable_masked` + `variable_decl_is_remapped_storage`
+//    plumbing then routes the variable to threadgroup memory at emission.
+//
+// gl_PerVertex builtin members are left unmasked — the existing tess
+// struct-parity force-include path handles them. Block-typed user
+// outputs are skipped from this classification (block-member masking
+// requires more granular infrastructure than the current
+// `mask_stage_output_by_location` exposes; not needed for the failing
+// `tessellation_shader_tessellation.barrier_*` cluster).
+void CompilerMSL::classify_tcs_outputs_by_consumption()
+{
+	if (!is_tesc_shader() || !msl_options.split_tcs_outputs_by_consumption)
+		return;
+
+	// Build the consumed-name set from outputs_by_location entries. AppGL's
+	// β orchestrator passes the TES input variable name in the
+	// MSLShaderInterfaceVariable.name field of each add_msl_shader_output
+	// call. For separable programs, location auto-assignment differs
+	// per-stage, so name is the stable cross-stage identifier.
+	std::unordered_set<std::string> consumed_names;
+	for (auto &kv : outputs_by_location)
+	{
+		if (!kv.second.name.empty())
+			consumed_names.insert(kv.second.name);
+	}
+	for (auto &kv : outputs_by_builtin)
+	{
+		if (!kv.second.name.empty())
+			consumed_names.insert(kv.second.name);
+	}
+
+	// If no consumed names were communicated, the classifier has no signal
+	// to act on. Stay defensive — don't mask anything. Caller error or
+	// transitional state (option set but β not yet passing names).
+	if (consumed_names.empty())
+		return;
+
+	// Build the inverse set: TCS's natural output names. Used to dedup
+	// outputs_by_location entries whose name matches a natural output —
+	// prevents the synth-fake-variable loop from creating opaque uint
+	// padding members (`uint4 m_<N>`) that displace the natural-output
+	// layout. The dedup runs only when split_tcs_outputs_by_consumption
+	// is on, preserving the existing synth behaviour for callers who
+	// haven't migrated to the new option.
+	std::unordered_set<std::string> tcs_natural_output_names;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		if (var.storage != StorageClassOutput)
+			return;
+		if (is_builtin_variable(var))
+			return;
+		const std::string &name = get_name(var.self);
+		if (!name.empty())
+			tcs_natural_output_names.insert(name);
+	});
+	for (auto it = outputs_by_location.begin(); it != outputs_by_location.end();)
+	{
+		if (!it->second.name.empty() && tcs_natural_output_names.count(it->second.name))
+			it = outputs_by_location.erase(it);
+		else
+			++it;
+	}
+
+	// Sentinel Location values for synthetic decoration of TCS-internal
+	// outputs. We use a high range (1000+) that doesn't collide with
+	// natural varying locations (typically < 64), so the existing
+	// auto-allocation system (which assigns locations during emission
+	// for un-decorated outputs) doesn't conflict. Each TCS-internal
+	// output gets a unique sentinel.
+	uint32_t synthetic_loc_counter = 0xF0000000u;
+
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t /*var_id*/, SPIRVariable &var) {
+		if (var.storage != StorageClassOutput)
+			return;
+		if (is_builtin_variable(var))
+			return; // Builtins handled by struct-parity path.
+
+		const auto &type = get<SPIRType>(var.basetype);
+		if (has_decoration(type.self, DecorationBlock))
+			return; // Block-typed outputs need per-member masking; not yet supported here.
+
+		// Skip per-patch outputs — the per-CP buffer stride concern
+		// doesn't apply to per-patch which lives in a separate buffer
+		// (slot 27).
+		if (has_decoration(var.self, DecorationPatch))
+			return;
+
+		const std::string &name = get_name(var.self);
+		if (name.empty())
+			return; // No name, can't classify.
+
+		if (consumed_names.count(name))
+			return; // TES-consumed, leave in main0_out.
+
+		// TCS-internal: assign a synthetic Location decoration (high
+		// range, won't collide with natural varying locations) and add
+		// to masked_output_locations via mask_stage_output_by_location.
+		// This drives the existing infrastructure across all relevant
+		// emission sites:
+		//  - add_variable_to_interface_block: variable doesn't appear
+		//    in main0_out struct.
+		//  - emit_local_masked_variable: emits threadgroup allocation
+		//    + alias (`threadgroup auto &VAR = spvStorageVAR[...]`).
+		//  - emit_tessellation_access_chain: returns false on masked
+		//    variable, falls through to standard CompilerGLSL emission
+		//    which generates `VAR[i]` (the threadgroup alias) rather
+		//    than `gl_out[i].VAR` (the device-buffer member).
+		//  - variable_decl_is_remapped_storage(StorageClassWorkgroup):
+		//    returns true, completing the threadgroup routing.
+		uint32_t loc;
+		if (has_decoration(var.self, DecorationLocation))
+		{
+			loc = get_decoration(var.self, DecorationLocation);
+		}
+		else
+		{
+			loc = synthetic_loc_counter++;
+			set_decoration(var.self, DecorationLocation, loc);
+		}
+		mask_stage_output_by_location(loc, 0);
+	});
 }
 
 void CompilerMSL::analyze_workgroup_variables()
@@ -19508,7 +22580,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 		check_resource_write(args[0]);
 		break;
 
-	// Emulate texture2D atomic operations
+	// Emulate image atomic operations
 	case OpAtomicExchange:
 	case OpAtomicCompareExchange:
 	case OpAtomicCompareExchangeWeak:
@@ -20044,6 +23116,48 @@ bool CompilerMSL::MemberSorter::operator()(uint32_t mbr_idx1, uint32_t mbr_idx2)
 			return mbr_meta1.component < mbr_meta2.component;
 		else
 			return mbr_meta1.location < mbr_meta2.location;
+	}
+	else if (sort_aspect == InsertionOrderThenLocationThenBuiltInType)
+	{
+		// Path J' Option E.3 (Sprint 6 Phase 1 — Class 2C range-gated):
+		// builtins to end (matches LocationThenBuiltInType behaviour).
+		// Non-builtins resolve in three tiers:
+		//   1. both names appear in `insertion_order` → compare positions
+		//   2. exactly one name appears → that one wins (orchestrator
+		//      cared enough to register it, so honor its position)
+		//   3. neither name appears → fall back to LocationThenBuiltInType
+		//      (avoids upending member layout for entries the orchestrator
+		//      didn't touch — typical for builtins absorbed into the
+		//      struct, or fragment-output mask members)
+		//
+		// Builtin handling identical to LocationThenBuiltInType — keeps
+		// `[[position]]`, `[[clip_distance]]`, etc. at the end of the
+		// struct where Metal's interface ABI expects them.
+		if (mbr_meta1.builtin != mbr_meta2.builtin)
+			return mbr_meta2.builtin;
+		if (mbr_meta1.builtin)
+			return mbr_meta1.builtin_type < mbr_meta2.builtin_type;
+
+		if (insertion_order)
+		{
+			int pos1 = -1, pos2 = -1;
+			for (size_t k = 0; k < insertion_order->size(); ++k)
+			{
+				if (pos1 < 0 && (*insertion_order)[k] == mbr_meta1.alias) pos1 = static_cast<int>(k);
+				if (pos2 < 0 && (*insertion_order)[k] == mbr_meta2.alias) pos2 = static_cast<int>(k);
+				if (pos1 >= 0 && pos2 >= 0) break;
+			}
+			if (pos1 >= 0 && pos2 >= 0)
+				return pos1 < pos2;
+			if (pos1 >= 0)
+				return true;  // mbr_idx1 ordered (in list); mbr_idx2 not — list-entry first
+			if (pos2 >= 0)
+				return false;
+		}
+		// Fall through — neither in list.
+		if (mbr_meta1.location == mbr_meta2.location)
+			return mbr_meta1.component < mbr_meta2.component;
+		return mbr_meta1.location < mbr_meta2.location;
 	}
 	else
 		return mbr_meta1.offset < mbr_meta2.offset;

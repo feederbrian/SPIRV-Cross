@@ -82,6 +82,48 @@ struct MSLShaderInterfaceVariable
 	BuiltIn builtin = BuiltInMax;
 	uint32_t vecsize = 0;
 	MSLShaderVariableRate rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+	// AppGL fork addition: optional name of the corresponding source-level
+	// varying. Used by `split_tcs_outputs_by_consumption` to do name-match
+	// classification across stages (separable programs auto-assign
+	// locations per-stage independently, so location alone is not a stable
+	// cross-stage identifier). Empty string = no name available; classifier
+	// falls back to location-based matching where possible.
+	std::string name;
+};
+
+// AppGL fork (msl-interface-introspection.patch): post-compile() readout of
+// the canonical MSL stage-interface struct. Lets the caller (AppGL runtime)
+// reflect the actual emitted layout instead of synthesizing a parallel one
+// from SPIR-V — eliminates "AppGL mirror of SPIRV-Cross logic decays as
+// patches evolve" bugs.
+struct MSLInterfaceMember
+{
+	std::string name;        // member identifier as emitted in MSL
+	uint32_t location = ~0u; // SPIR-V Location decoration; ~0u when builtin or implicit
+	uint32_t component = 0;  // SPIR-V Component decoration; 0 unless multi-scalar packing at one location
+	BuiltIn builtin = BuiltInMax; // BuiltInMax for user varyings; otherwise the gl_* builtin
+	bool is_builtin = false;
+	SPIRType::BaseType base_type = SPIRType::Unknown; // Float / Int / UInt / Half / etc.
+	uint32_t bit_width = 0;  // 8, 16, 32, 64
+	uint32_t vecsize = 0;    // 1=scalar, 2=vec2, 3=vec3, 4=vec4
+	uint32_t columns = 0;    // matrix columns; 1 for non-matrix
+	uint32_t array_size = 0; // 0 if not an array, else element count
+	uint32_t offset = 0;     // bytes from struct base, per Metal packing
+	uint32_t size = 0;       // bytes; for arrays, the total array size
+};
+
+// Layout result: members + the padded total size + struct alignment that
+// callers need for stride math (TF buffer writes, gl_in[i] indexing, etc.).
+// `struct_size` is rounded up to `struct_alignment` per Metal C ABI rules,
+// matching the `sizeof(struct)` value the MSL compiler computes.
+// `unpadded_end` is the offset+size of the last member without trailing
+// padding; rarely useful but exposed for diagnostic purposes.
+struct MSLInterfaceLayout
+{
+	std::vector<MSLInterfaceMember> members;
+	uint32_t struct_size = 0;
+	uint32_t struct_alignment = 0;
+	uint32_t unpadded_end = 0;
 };
 
 // Matches the binding index of a MSL resource for a binding within a descriptor set.
@@ -428,6 +470,285 @@ public:
 		// to index the output buffer.
 		bool vertex_for_tessellation = false;
 
+		// AppGL fork: lower SPIR-V FP64 values to a legal Metal df64 transport
+		// representation. Metal does not expose native fp64 arithmetic on Apple
+		// GPUs, so this option maps double/dvec/dmat types to AppGL helper
+		// structs backed by uint2 words and emits helper calls for arithmetic.
+		// Runtime extension advertising remains owned by AppGL's FP64 module.
+		bool appgl_fp64_emulation = false;
+
+		// AppGL fork addition (phase-3B-metal-tess-TF): when set, a
+		// tessellation evaluation shader is translated as a compute
+		// kernel rather than a `[[patch(...)]] vertex` function.
+		// Used by the AppGL transform-feedback capture path, which
+		// dispatches one TES kernel thread per tessellator-generated
+		// vertex (the caller supplies the domain coords in a buffer;
+		// the kernel writes per-vertex TF output into a user-bound
+		// buffer). Companion to `vertex_for_tessellation` but for
+		// the post-tessellator stage.
+		//
+		// Requires `raw_buffer_tese_input = true` so gl_in / per-patch
+		// inputs already live in buffers (buffer slots 22 / 20).
+		// Output is written through a new TF-capture struct at
+		// `shader_output_buffer_index` (buffer 28 by default).
+		//
+		// Orthogonal to isoline-tessellation support, which Metal
+		// does not implement natively — the compute form still
+		// throws on isolines. Domain-point generation for isolines
+		// happens on the AppGL side.
+		bool tess_evaluation_as_compute = false;
+
+		// AppGL fork: per-patch control-point count for TES compilation.
+		// The TES's own IR has no output_vertices; this value is the
+		// TCS's `layout(vertices = N) out;` and is needed to emit the
+		// correct stride in
+		//   gl_in = &spvIn[gl_PrimitiveID * N];
+		// (was `* 0` when unset, collapsing all patches to the origin).
+		// 0 = fall back to existing behaviour.
+		uint32_t tese_input_patch_vertices = 0;
+
+		// AppGL fork addition (msl-tcs-output-classification.patch):
+		// classify each TCS user-varying output by whether the linked
+		// downstream TES consumes it. TES-consumed outputs route to the
+		// per-CP device buffer (the existing default behaviour).
+		// TCS-internal outputs — those used purely for inter-invocation
+		// sync via `barrier()` and never read by TES — are masked out
+		// of the per-CP buffer struct and routed to **threadgroup
+		// memory** instead. Threadgroup memory is the natural Metal
+		// home for inter-invocation sync data: it doesn't leak into the
+		// device buffer the TES reads, doesn't bloat the per-CP stride,
+		// and exists for the lifetime of the workgroup which matches a
+		// TCS patch.
+		//
+		// Classification mechanism: a TCS output is TES-consumed iff
+		// its location appears in the `outputs_by_location` map (or its
+		// builtin appears in `outputs_by_builtin`), which the AppGL
+		// runtime populates via `add_msl_shader_output` calls based on
+		// the linked TES's input interface. Outputs absent from those
+		// maps are TCS-internal.
+		//
+		// Implementation: leverages SPIRV-Cross's existing
+		// `mask_stage_output_by_location` / `_by_builtin` API to flag
+		// TCS-internal outputs as "masked"; the existing
+		// `variable_decl_is_remapped_storage(StorageClassWorkgroup)`
+		// path then routes masked TCS outputs to threadgroup memory at
+		// emission time. No new emission code paths required.
+		//
+		// Use case: separable-program tess pipelines where the TCS uses
+		// `out` arrays + `barrier()` for inter-invocation
+		// coordination (e.g. CTS `tessellation_shader_tessellation.{
+		// barrier_guarded_read_calls, barrier_guarded_read_write_calls,
+		// input_patch_discard }` cluster). Without this option, the
+		// per-CP buffer stride balloons with TCS-internal arrays the
+		// TES never reads, breaking byte-offset alignment between
+		// TCS-out and TES-in.
+		//
+		// Default false (existing behaviour: all TCS outputs in the
+		// per-CP device buffer).
+		bool split_tcs_outputs_by_consumption = false;
+
+		// AppGL fork addition (msl-geometry-shader-as-mesh.patch): emit
+		// geometry shaders (`ExecutionModelGeometry`) as Metal mesh
+		// shaders (`[[mesh]] void main0(...)`) instead of the current
+		// non-functional vertex-form emission. Targets Metal devices
+		// with mesh shader support (Apple GPU family 7+ / Metal 3+);
+		// chips lacking support fall back to the AppGL CPU geometry
+		// shader interpreter via runtime capability detection.
+		//
+		// Emission strategy: each GS invocation maps to one mesh
+		// threadgroup with a single thread. `OpEmitVertex` becomes a
+		// member-by-member copy of the per-vertex output struct into
+		// `gl_MeshVerticesEXT[spvVertexIndex]` followed by `++spvVertexIndex`.
+		// `OpEndPrimitive` writes triangle/line/point indices into
+		// `gl_PrimitiveTriangleIndicesEXT` (or LineIndicesEXT /
+		// PointIndicesEXT) based on the GS output topology, captures
+		// per-primitive outputs (gl_Layer / gl_PrimitiveID / gl_ViewportIndex)
+		// from the latched per-primitive struct, and increments
+		// `spvPrimitiveIndex`. At function exit, `SetMeshOutputsEXT(
+		// spvVertexIndex, spvPrimitiveIndex)` emits the meshlet sizes.
+		//
+		// Out of scope (deferred per Sprint 3 narrowed plan):
+		//  - Streams (gl_StreamID 0-3): mesh shaders have no native
+		//    multi-stream output; would need multi-dispatch or stream-
+		//    tagged single-dispatch emulation.
+		//  - Adjacency input topologies (`triangle_adjacency`,
+		//    `line_adjacency`): no mesh shader equivalent; tests using
+		//    these stay on the AppGL CPU GS interpreter.
+		//  - GS-after-TES interaction (geometry shader running on TES
+		//    output): cross-pipeline coordination outside this option's
+		//    scope.
+		//
+		// Requires `msl_version >= 30000` (Metal 3.0); mesh shaders are
+		// not available in earlier Metal versions.
+		bool geometry_shader_as_mesh = false;
+
+		// AppGL fork addition: emit `threadgroup_barrier(mem_flags::mem_device)`
+		// at the end of a `vertex_for_tessellation`-mode VS-as-compute kernel.
+		// Apple's AIR optimizer + Metal driver appear to silently eliminate
+		// `device main0_out* spvOut` writes when the consumer is in a different
+		// encoder family (compute → render mesh-pipeline) — writes survive
+		// the compute → compute path (Phase-3 metal-tess), vanish on
+		// compute → render (mesh-GS Phase 2). The end-of-kernel device-memory
+		// barrier signals that all device writes are ordered before kernel
+		// exit, blocking the AIR-layer elimination.
+		//
+		// Default off — preserves existing tess→tess byte-identical
+		// emission. AppGL-W enables for VS-compute targeting mesh-pipeline
+		// consumption; tess→tess remains unchanged. Uses
+		// `mem_flags::mem_device` (not `mem_device_and_threadgroup`)
+		// because no threadgroup memory is shared in this VS-compute path.
+		//
+		// **Empirical calibration (Path E):** the barrier alone was tested
+		// insufficient against Apple's AIR cross-encoder-family elimination —
+		// when no in-kernel use of spvOut is observable, the AIR optimizer
+		// can eliminate writes + the barrier as a unit. The barrier flag is
+		// preserved for calibration value (and for the case where future
+		// Apple driver behavior changes); the load-bearing mitigation is
+		// `force_compute_kernel_device_volatile_writes` below.
+		bool force_compute_kernel_device_barrier_at_exit = false;
+
+		// AppGL fork addition (Path E++): emit
+		// `volatile device main0_out* spvOut [[buffer(28)]]` instead of
+		// `device main0_out*` for `vertex_for_tessellation +
+		// capture_output_to_buffer` VS-compute kernels. Per Apple's MSL spec
+		// `volatile` is contractually preserved across optimizer passes —
+		// each write through a `volatile`-qualified pointer must be observable
+		// at its source location. This blocks the AIR cross-encoder-family
+		// elimination class that the bare barrier (above) was empirically
+		// insufficient to defeat.
+		//
+		// Default off — preserves byte-identical emission for the Phase-3
+		// metal-tess (compute → compute) path. AppGL-W's runtime enables
+		// (typically alongside `force_compute_kernel_device_barrier_at_exit`)
+		// for VS-compute targeting mesh-pipeline consumption.
+		bool force_compute_kernel_device_volatile_writes = false;
+
+		// AppGL fork addition (Path E+++): convert each VS-compute write
+		// to spvOut into `atomic_store_explicit` with a per-scalar
+		// reinterpret to uint. Per Apple's MSL spec, atomic stores
+		// contractually cannot be eliminated by the AIR optimizer —
+		// the load-bearing strength tier escalation after barrier
+		// (Path E) and volatile (Path E++) were both empirically
+		// insufficient against AIR cross-encoder-family elimination.
+		// `memory_order_relaxed` keeps overhead low (no cross-thread
+		// ordering implied). Vec/array writes are decomposed into
+		// per-scalar atomic stores. Default off — tess→tess
+		// unchanged.
+		bool force_compute_kernel_atomic_writes_on_spvOut = false;
+
+		// AppGL fork addition (Path E+++ diagnostic): add a
+		// `device atomic_uint* spvKernelEntryCounter [[buffer(N)]]`
+		// parameter to VS-compute kernels and emit
+		// `atomic_fetch_add_explicit(spvKernelEntryCounter, 1u,
+		// memory_order_relaxed);` in the kernel preamble. Definitively
+		// answers "did the kernel body execute" — if AppGL-W's
+		// readback shows counter > 0 the kernel ran and any subsequent
+		// buffer-state divergence is AIR/optimizer behavior; if
+		// counter == 0 the dispatch was issued but the kernel body
+		// didn't run, indicating a different-layer issue (binding,
+		// resource tracking, etc.). Slot defaults to
+		// `entry_counter_buffer_index` (27 by default) — orthogonal to
+		// shader_output_buffer_index (28). Default off; orthogonal to
+		// the atomic_writes flag — the probe can be used standalone.
+		bool force_compute_kernel_entry_counter_probe = false;
+		uint32_t entry_counter_buffer_index = 27;
+
+		// AppGL fork addition (Path G — kernel-arg attribute fix):
+		// emit `[[threads_per_grid]]` instead of `[[grid_size]]` for the
+		// implicit `spvStageInputSize` parameter on `vertex_for_tessellation`
+		// VS-compute kernels.
+		//
+		// `[[grid_size]]` is documented as the threadgroup grid dimensions
+		// (the number-of-threadgroups argument to dispatchThreadgroups:).
+		// On Apple Silicon under both `dispatchThreads:` and
+		// `dispatchThreadgroups:` it returns `(0, 0, 0)` for these
+		// kernel signatures — observed via kernel-internal probing
+		// (write each builtin attribute to a buffer from thread 0 +
+		// inspect from outside). Effect: every thread early-returns at
+		// `if (any(gl_GlobalInvocationID >= spvStageInputSize)) return;`
+		// because `any(>= 0)` is universally true. Kernel body never
+		// runs; cmdBuf reports Completed; all external diagnostics
+		// (capture inspector, PSO API queries, validation layers) show
+		// clean. Path E barrier / E++ volatile / E+++ atomic
+		// mitigations were all attempting to preserve writes from a
+		// kernel body that never executed.
+		//
+		// `[[threads_per_grid]]` is the actual thread count of the
+		// entire grid — what bounds checks should reference for
+		// `dispatchThreads:`-shaped dispatches. Changes the synthesized
+		// argument's attribute only; `gl_GlobalInvocationID` and
+		// downstream code keep their existing forms.
+		//
+		// Default off — preserves byte-identical emission for the
+		// Phase-3 metal-tess (compute → compute) path. AppGL-W's
+		// runtime enables for both VS-compute paths (mesh-GS AND tess)
+		// since the fix is more correct per Apple's MSL spec
+		// semantics.
+		bool force_threads_per_grid_for_stage_input_size = false;
+
+		// AppGL fork addition (Path L — Sprint 4 sub-cluster A): emit
+		// TES-as-compute reads of `gl_TessLevelOuter` / `gl_TessLevelInner`
+		// from a full-precision `device const float*` shadow buffer
+		// instead of from Metal's half-precision
+		// `MTLQuadTessellationFactorsHalf` / `MTLTriangleTessellationFactorsHalf`
+		// API (member access via `.edgeTessellationFactor[k]` /
+		// `.insideTessellationFactor[k]`).
+		//
+		// Per GL 4.6 §11.2.2, outer/inner tess level values are float;
+		// CTS validates with float precision. Metal's half-precision
+		// API truncates information at write time (CKPT25 Option B
+		// elimination demonstrated lossy-write). Full-precision shadow
+		// buffer preserves the float precision the CTS expects.
+		//
+		// Buffer layout (per primitive, stride depends on domain):
+		//   triangles: 4 floats = 3 outer + 1 inner
+		//   quads:     6 floats = 4 outer + 2 inner
+		//   isolines:  2 floats = 2 outer + 0 inner
+		// Outer levels first, then inner levels per primitive.
+		// Read pattern: `spvTessLevelFull[gl_PrimitiveID * stride + index]`.
+		//
+		// Flag-gated (not default-on) because consumers must provide the
+		// shadow buffer infrastructure at the documented slot. AppGL fork
+		// consumers + cross-project consumers (MoltenVK on Vulkan-on-Metal
+		// has the same Metal half-precision constraint) can opt in;
+		// default-off preserves byte-identical emission for existing
+		// consumers without shadow buffer infrastructure.
+		bool use_full_precision_tess_level_buffer = false;
+		uint32_t shader_tess_factor_buffer_full_index = 23;
+
+		// Path J' Option E.4 (Sprint 6 Phase 1 — paired Class 2A + 2C
+		// extension after CKPT39 rig-vs-integration symmetry violation):
+		// when set, `add_interface_block(StorageClassInput)` orders
+		// `main0_in` members by the orchestrator's `add_msl_shader_input`
+		// call sequence rather than by Location ascending. The flag is
+		// the explicit opt-in gate for the
+		// `MemberSorter::InsertionOrderThenLocationThenBuiltInType`
+		// sort aspect introduced in Option E.3 (gate 20).
+		//
+		// Why a flag (vs unconditional widening): the public C API
+		// `spvc_compiler_msl_add_shader_input` is used by upstream
+		// consumers (MoltenVK, vkd3d-proton) who register their inputs
+		// via this path. Unconditional widening would change emission
+		// order for any such consumer. Default-off preserves
+		// `LocationThenBuiltInType` emission for existing consumers;
+		// AppGL fork orchestrators set this flag explicitly to opt
+		// into call-order emission.
+		//
+		// Why explicit flag (vs synthetic-range gate from E.3): CKPT39
+		// surfaced that AppGL-W's β orchestrator passes natural-range
+		// locations when the TCS sibling has explicit Location decoration
+		// (the typical case — `layout(location=N)` qualifiers, glslc-
+		// assigned locations in monolithic programs), and only escalates
+		// to synthetic-range (0xE0000000+id) when natural location is
+		// absent. E.3's synthetic-range-gated recording therefore captured
+		// 0% of typical production calls, leaving the insertion-order
+		// list empty and the new aspect dormant — standalone rig PASS,
+		// integration FAIL. The flag makes the gate explicit + caller-
+		// agnostic. Recording (Class 2A) widens to all non-empty-name
+		// calls regardless of range; emission (Class 2C) gates on the
+		// flag.
+		bool input_emission_in_call_order = false;
+
 		// Assume that SubpassData images have multiple layers. Layered input attachments
 		// are addressed relative to the Layer output from the vertex pipeline. This option
 		// has no effect with multiview, since all input attachments are assumed to be layered
@@ -665,6 +986,29 @@ public:
 	// If shader outputs are provided, is_msl_shader_output_used() will return true after
 	// calling ::compile() if the location were used by the MSL code.
 	void add_msl_shader_output(const MSLShaderInterfaceVariable &output);
+
+	// AppGL fork: enumerate the canonical MSL stage-interface struct after
+	// compile(). Returns the actual emitted layout — name, location,
+	// builtin, type, per-member offset/size, plus the total struct size
+	// (padded to alignment) and the struct's alignment. Callers should
+	// reflect against this instead of synthesizing a parallel layout from
+	// SPIR-V — that mirror would decay silently as the emission patches
+	// evolve.
+	//
+	// storage_class:  StorageClassInput  → main0_in (per-vertex/per-CP) or patch in
+	//                 StorageClassOutput → main0_out (per-vertex/per-CP) or patch out
+	// patch:          false → per-vertex / per-CP interface (default)
+	//                 true  → per-patch interface (TCS patch outputs, TES patch inputs)
+	//
+	// Returns a layout with empty `members` if compile() has not run, if
+	// the requested interface is not present (e.g. patch=true on a stage
+	// with no patch interface), or if storage_class is not Input/Output.
+	//
+	// Asserts (in debug builds) that the running offset after all members
+	// is consistent with the computed struct_size, catching future emitter
+	// changes that invalidate the introspected offsets.
+	MSLInterfaceLayout get_msl_interface_layout(
+	    StorageClass storage_class, bool patch = false) const;
 
 	// resource is a resource binding to indicate the MSL buffer,
 	// texture or sampler index to use for a particular SPIR-V description set
@@ -907,6 +1251,7 @@ protected:
 	void emit_spv_amd_shader_trinary_minmax_op(uint32_t result_type, uint32_t result_id, uint32_t op,
 	                                           const uint32_t *args, uint32_t count) override;
 	void emit_header() override;
+	void emit_appgl_fp64_emulation_helpers();
 	void emit_function_prototype(SPIRFunction &func, const Bitset &return_flags) override;
 	void emit_sampled_image_op(uint32_t result_type, uint32_t result_id, uint32_t image_id, uint32_t samp_id) override;
 	void emit_subgroup_op(const Instruction &i) override;
@@ -933,6 +1278,7 @@ protected:
 	// Allow Metal to use the array<T> template to make arrays a value type
 	std::string type_to_array_glsl(const SPIRType &type, uint32_t variable_id) override;
 	std::string constant_op_expression(const SPIRConstantOp &cop) override;
+	std::string constant_expression_vector(const SPIRConstant &c, uint32_t vector) override;
 
 	bool variable_decl_is_remapped_storage(const SPIRVariable &variable, StorageClass storage) const override;
 
@@ -951,6 +1297,13 @@ protected:
 
 	std::string unpack_expression_type(std::string expr_str, const SPIRType &type, uint32_t physical_type_id,
 	                                   bool is_packed, bool row_major) override;
+
+	bool appgl_fp64_emulation_enabled_for_type(const SPIRType &type) const;
+	bool appgl_fp64_emulation_enabled_for_type_id(uint32_t type_id) const;
+	bool appgl_fp64_module_uses_emulation() const;
+	std::string appgl_fp64_msl_type_name(const SPIRType &type) const;
+	std::string appgl_fp64_constant_component(const SPIRConstant &c, uint32_t col, uint32_t row);
+	std::string appgl_fp64_float_literal(float value) const;
 
 	// Returns true for BuiltInSampleMask because gl_SampleMask[] is an array in SPIR-V, but [[sample_mask]] is a scalar in Metal.
 	bool builtin_translates_to_nonarray(BuiltIn builtin) const override;
@@ -996,6 +1349,58 @@ protected:
 	uint32_t add_interface_block(StorageClass storage, bool patch = false);
 	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
 	uint32_t add_meshlet_block(bool per_primitive);
+
+	// Path A++ gate 7 (msl-geometry-shader-as-mesh.patch): shared-struct
+	// layout parity. Walks the GS's input gl_PerVertex block in IR,
+	// finds gl_ClipDistance / gl_CullDistance members the existing
+	// add_interface_block flow dropped, and injects them into main0_in
+	// so its byte layout matches the linked-VS main0_out emission.
+	void ensure_gs_as_mesh_gl_per_vertex_parity();
+
+	// Phase 2.5 Gap B (msl-geometry-shader-as-mesh.patch): emits the
+	// EndPrimitive flush sequence for the GS-as-mesh path. Shared
+	// between explicit `OpEndPrimitive` and Path H's implicit
+	// function-exit flush. Branches on output topology +
+	// max_vertices:
+	//   - triangle_strip with max_vertices ≤ 3: 1-triangle simple emit
+	//     (preserves byte-identical output for the synthetic / Phase 2
+	//     MVP envelope).
+	//   - triangle_strip with max_vertices > 3: strip-to-list expansion
+	//     loop with even/odd winding alternation per GL §10.1.13.
+	//   - line_strip with max_vertices ≤ 2: 1-line simple emit.
+	//   - line_strip with max_vertices > 2: (N-1)-line expansion loop.
+	//   - points: 1-point emit (max_vertices irrelevant).
+	void emit_gs_as_mesh_endprimitive();
+
+	// Path J' Option E (Sprint 6 — Class 2A spec-compliance): walks
+	// SPIR-V Input variables at compile() preamble, populates
+	// `inputs_by_location` with each natural Input variable's name +
+	// location + component, then dedupes any synthetic-range entry
+	// (location >= 0xE0000000) whose name matches a natural-range
+	// entry. Coordinates with Path J' Option A1's add-time dedupe
+	// (fce60f8) — Option A1 fires when consumers call
+	// `add_msl_shader_input` AFTER compile() pre-population has run;
+	// Option E catches the typical case where consumers register
+	// synthetic-range entries BEFORE compile() (the order Option A1's
+	// add-time check can't see naturally-emitted Input variables yet).
+	// The combined effect: `inputs_by_location` is canonical for both
+	// API-registered and natural-emission entries by the time
+	// `add_interface_block(StorageClassInput)` runs.
+	void pre_populate_inputs_by_location_from_ir();
+
+	// Phase 2.5 Gap A (msl-geometry-shader-as-mesh.patch): synthesizes
+	// a `gl_Position` Output variable in IR for GS-as-mesh shaders that
+	// don't write one. Apple Metal mesh shader vertex types must declare
+	// a `[[position]]` member; GLSL geometry shaders that omit
+	// `gl_Position = ...` (TF-only / depth-only patterns) violate this
+	// requirement. Synthesizing a vec4 Output with BuiltInPosition
+	// decoration carries through the existing add_meshlet_block /
+	// spvPerVertex emission machinery without further changes — the
+	// body never writes it, the function-local `spvVertices = {}`
+	// zero-init carries the default value (0,0,0,0) through to
+	// set_vertex.
+	void ensure_gs_as_mesh_position_output();
+
 
 	struct InterfaceBlockMeta
 	{
@@ -1218,6 +1623,28 @@ protected:
 	std::set<SPVFuncImpl> spv_function_implementations;
 	// Must be ordered to ensure declarations are in a specific order.
 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> inputs_by_location;
+	// Path J' Option E.3 (Sprint 6 Phase 1 — paired Class 2A + 2C):
+	// names recorded at `add_msl_shader_input` call time for synthetic-
+	// range entries (location >= 0xE0000000), in call-arrival order. The
+	// list captures the orchestrator's intended cross-stage emission
+	// sequence (e.g., a TCS-out struct field order that TES-in must
+	// match for cross-stage byte alignment). When non-empty, the
+	// `add_interface_block` IR walk and supplementation walk both
+	// reorder their per-member emission to honor this list, replacing
+	// the default IR-ID order / map-key order. Empty by default —
+	// non-AppGL consumers retain unchanged emission ordering.
+	//
+	// Class 2A side: preamble-time uniform record (every synthetic-
+	// range `add_msl_shader_input` call appends, regardless of whether
+	// the entry survives Path J' Option A1's add-time dedupe — the
+	// orchestrator's intent is "emit this name at this position" even
+	// if the synthetic-keyed map entry itself gets deduped against a
+	// natural-loc entry).
+	//
+	// Class 2C side: emission-time gate fires only when the list is
+	// non-empty (range-gated on synthetic-match having actually
+	// happened). Default-empty consumers see no behavior change.
+	std::vector<std::string> inputs_by_location_insertion_order;
 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> inputs_by_builtin;
 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> outputs_by_location;
 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> outputs_by_builtin;
@@ -1337,6 +1764,15 @@ protected:
 	                                             const SPIRVariable &base_var);
 
 	void analyze_argument_buffers();
+
+	// AppGL fork (msl-tcs-output-classification.patch): for TCS shaders
+	// under `split_tcs_outputs_by_consumption`, classifies each user-varying
+	// output as TES-consumed (kept in main0_out / per-CP device buffer)
+	// or TCS-internal (routed to threadgroup memory by the existing
+	// remapped-storage mechanism). Run after `update_active_builtins`
+	// in `compile_internal`, before any emission walks the variables.
+	void classify_tcs_outputs_by_consumption();
+
 	bool descriptor_set_is_argument_buffer(uint32_t desc_set) const;
 	const MSLResourceBinding &get_argument_buffer_resource(uint32_t desc_set, uint32_t arg_idx) const;
 	void add_argument_buffer_padding_buffer_type(SPIRType &struct_type, uint32_t &mbr_idx, uint32_t &arg_buff_index, MSLResourceBinding &rez_bind);
@@ -1423,7 +1859,15 @@ protected:
 		enum SortAspect
 		{
 			LocationThenBuiltInType,
-			Offset
+			Offset,
+			// Path J' Option E.3 (Sprint 6 Phase 1 — Class 2C range-gated):
+			// builtins go to the end (matching LocationThenBuiltInType);
+			// non-builtins are sorted by their position in `insertion_order`
+			// when matched, fall through to location-then-component
+			// otherwise. Used for input interface blocks when the
+			// orchestrator registered synthetic-range names via
+			// `add_msl_shader_input` to drive cross-stage emission layout.
+			InsertionOrderThenLocationThenBuiltInType
 		};
 
 		void sort();
@@ -1433,6 +1877,11 @@ protected:
 		SPIRType &type;
 		Meta &meta;
 		SortAspect sort_aspect;
+		// Path J' Option E.3: pointer to the parent compiler's
+		// `inputs_by_location_insertion_order` list. Owned by CompilerMSL;
+		// MemberSorter only reads. Null when no orchestrator-driven
+		// reorder is active.
+		const std::vector<std::string> *insertion_order = nullptr;
 	};
 };
 } // namespace SPIRV_CROSS_NAMESPACE
