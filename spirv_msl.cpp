@@ -4624,6 +4624,8 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 		bool builtin_is_stage_in_out = builtin_is_gl_in_out ||
 		                               bi_type == BuiltInLayer || bi_type == BuiltInViewportIndex ||
 		                               bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR ||
+		                               bi_type == BuiltInShadingRateKHR ||
+		                               bi_type == BuiltInPrimitiveShadingRateKHR ||
 		                               bi_type == BuiltInFragDepth ||
 		                               bi_type == BuiltInFragStencilRefEXT || bi_type == BuiltInSampleMask;
 
@@ -4655,6 +4657,8 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 
 		// ClipDistance is never hidden, we need to emulate it when used as an input.
 		if (bi_type == BuiltInClipDistance || bi_type == BuiltInCullDistance)
+			hidden = false;
+		if (bi_type == BuiltInShadingRateKHR)
 			hidden = false;
 
 		// It's not enough to simply avoid marking fragment outputs if the pipeline won't
@@ -16259,6 +16263,11 @@ string CompilerMSL::to_struct_member(const SPIRType &type, uint32_t member_type_
 
 	SPIRType row_major_physical_type { OpTypeMatrix };
 	const SPIRType *declared_type = &physical_type;
+	BuiltIn appgl_member_builtin = BuiltInMax;
+	const bool appgl_fsr_builtin_member =
+		is_member_builtin(type, index, &appgl_member_builtin) &&
+		(appgl_member_builtin == BuiltInShadingRateKHR ||
+		 appgl_member_builtin == BuiltInPrimitiveShadingRateKHR);
 
 	// If a struct is being declared with physical layout,
 	// do not use array<T> wrappers.
@@ -16426,6 +16435,8 @@ string CompilerMSL::to_struct_member(const SPIRType &type, uint32_t member_type_
 	}
 	else
 		decl_type = type_to_glsl(*declared_type, orig_id, true);
+	if (appgl_fsr_builtin_member)
+		decl_type = "uint";
 
 	if (physical_type.basetype == SPIRType::Struct &&
 	    has_decoration(physical_type.self, DecorationArrayStride) &&
@@ -17448,6 +17459,7 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
 	case BuiltInHelperInvocation:
 	case BuiltInBaryCoordKHR:
 	case BuiltInBaryCoordNoPerspKHR:
+	case BuiltInShadingRateKHR:
 		return false;
 	case BuiltInViewIndex:
 		return get_execution_model() == ExecutionModelFragment && msl_options.multiview &&
