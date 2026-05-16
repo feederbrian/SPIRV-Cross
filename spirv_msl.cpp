@@ -13205,7 +13205,9 @@ void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
 				return;
 			}
 		}
-		if (get_execution_model() == ExecutionModelGLCompute &&
+		const auto execution_model = get_execution_model();
+		if ((execution_model == ExecutionModelGLCompute ||
+		     execution_model == ExecutionModelFragment) &&
 		    (op == OpImageSparseFetch ||
 		     op == OpImageSparseSampleImplicitLod ||
 		     op == OpImageSparseSampleExplicitLod ||
