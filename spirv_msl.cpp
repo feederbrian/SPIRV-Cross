@@ -14991,7 +14991,8 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
 		is_dynamic_img_sampler = has_extended_decoration(var->self, SPIRVCrossDecorationDynamicImageSampler);
 	}
 
-	if (args.base.is_gather && args.base.imgtype->image.dim == DimRect && !is_dynamic_img_sampler &&
+	if (!args.is_sparse_feedback &&
+	    args.base.is_gather && args.base.imgtype->image.dim == DimRect && !is_dynamic_img_sampler &&
 	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
 	{
 		const bool is_compare = args.has_dref || comparison_ids.count(img);
@@ -15192,6 +15193,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	string farg_str;
 	bool forward = true;
 	const bool uses_rect_gather_helper =
+	    !args.is_sparse_feedback &&
 	    args.base.is_gather && imgtype.image.dim == DimRect && (!args.has_array_offsets || args.dref);
 
 	if (!is_dynamic_img_sampler)

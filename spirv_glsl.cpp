@@ -8276,6 +8276,7 @@ std::string CompilerGLSL::to_texture_op(const Instruction &i, bool sparse, bool 
 	args.sparse_texel = sparse_texel_id;
 	args.min_lod = minlod;
 	args.nonuniform_expression = nonuniform_expression;
+	args.is_sparse_feedback = sparse;
 	expr += to_function_args(args, forward);
 	expr += ")";
 

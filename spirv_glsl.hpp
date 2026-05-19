@@ -491,6 +491,7 @@ protected:
 		uint32_t grad_x = 0, grad_y = 0, lod = 0, offset = 0;
 		uint32_t bias = 0, component = 0, sample = 0, sparse_texel = 0, min_lod = 0;
 		bool nonuniform_expression = false, has_array_offsets = false;
+		bool is_sparse_feedback = false;
 	};
 	virtual std::string to_function_args(const TextureFunctionArguments &args, bool *p_forward);
 
