@@ -7530,10 +7530,14 @@ void CompilerMSL::emit_custom_functions()
 	}
 
 	if (spv_function_implementations.count(SPVFuncImplGatherSwizzle) ||
-	    spv_function_implementations.count(SPVFuncImplGatherConstOffsets))
+	    spv_function_implementations.count(SPVFuncImplGatherConstOffsets) ||
+	    spv_function_implementations.count(SPVFuncImplGatherRect))
 	{
 		spv_function_implementations.insert(SPVFuncImplGatherReturn);
 	}
+
+	if (spv_function_implementations.count(SPVFuncImplGatherRectCompareConstOffsets))
+		spv_function_implementations.insert(SPVFuncImplGatherRectCompare);
 
 	if (spv_function_implementations.count(SPVFuncImplGatherCompareSwizzle) ||
 	    spv_function_implementations.count(SPVFuncImplGatherCompareConstOffsets))
@@ -8313,6 +8317,60 @@ void CompilerMSL::emit_custom_functions()
 				end_scope();
 				statement("");
 			}
+			break;
+
+		case SPVFuncImplGatherRect:
+			statement("// Wrapper function that gathers from GL rectangle textures using unnormalized pixel coordinates.");
+			statement("template<typename Tex>");
+			statement("inline spvGatherReturn<Tex, float2> spvGatherRect(Tex t, "
+			          "float2 coord, int2 offset, component c) METAL_CONST_ARG(c)");
+			begin_scope();
+			statement("int2 base = int2(floor(coord - 0.5)) + offset;");
+			statement("int2 max_coord = int2(int(t.get_width()), int(t.get_height())) - int2(1);");
+			statement("auto p00 = t.read(uint2(clamp(base + int2(0, 0), int2(0), max_coord)));");
+			statement("auto p10 = t.read(uint2(clamp(base + int2(1, 0), int2(0), max_coord)));");
+			statement("auto p01 = t.read(uint2(clamp(base + int2(0, 1), int2(0), max_coord)));");
+			statement("auto p11 = t.read(uint2(clamp(base + int2(1, 1), int2(0), max_coord)));");
+			// texture::gather returns (i0j1, i1j1, i1j0, i0j0); mirror that
+			// ordering while avoiding Metal gather's normalized-sampler requirement.
+			statement("switch (c)");
+			begin_scope();
+			statement("case component::x:");
+			statement("    return spvGatherReturn<Tex, float2>(p01.x, p11.x, p10.x, p00.x);");
+			statement("case component::y:");
+			statement("    return spvGatherReturn<Tex, float2>(p01.y, p11.y, p10.y, p00.y);");
+			statement("case component::z:");
+			statement("    return spvGatherReturn<Tex, float2>(p01.z, p11.z, p10.z, p00.z);");
+			statement("case component::w:");
+			statement("    return spvGatherReturn<Tex, float2>(p01.w, p11.w, p10.w, p00.w);");
+			end_scope();
+			end_scope();
+			statement("");
+			break;
+
+		case SPVFuncImplGatherRectCompare:
+			statement("// Wrapper function that gathers depth compares from GL rectangle textures.");
+			statement("template<typename Tex>");
+			statement("inline float4 spvGatherRectCompare(Tex t, float2 coord, float ref, int2 offset = int2(0))");
+			begin_scope();
+			statement("constexpr sampler spvRectCompareSampler(coord::normalized, address::clamp_to_edge, "
+			          "filter::nearest, compare_func::less_equal);");
+			statement("return t.gather_compare(spvRectCompareSampler, coord / float2(t.get_width(), t.get_height()), ref, offset);");
+			end_scope();
+			statement("");
+			break;
+
+		case SPVFuncImplGatherRectCompareConstOffsets:
+			statement("// Wrapper function that processes a rectangle depth gather with a constant offset array.");
+			statement("template<typename Tex, typename Toff>");
+			statement("inline float4 spvGatherRectCompareConstOffsets(Tex t, Toff coffsets, float2 coord, float ref)");
+			begin_scope();
+			statement("return float4(spvGatherRectCompare(t, coord, ref, coffsets[0]).w, "
+			          "spvGatherRectCompare(t, coord, ref, coffsets[1]).w, "
+			          "spvGatherRectCompare(t, coord, ref, coffsets[2]).w, "
+			          "spvGatherRectCompare(t, coord, ref, coffsets[3]).w);");
+			end_scope();
+			statement("");
 			break;
 
 		case SPVFuncImplSubgroupBroadcast:
@@ -14933,6 +14991,22 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
 		is_dynamic_img_sampler = has_extended_decoration(var->self, SPIRVCrossDecorationDynamicImageSampler);
 	}
 
+	if (args.base.is_gather && args.base.imgtype->image.dim == DimRect && !is_dynamic_img_sampler &&
+	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
+	{
+		const bool is_compare = args.has_dref || comparison_ids.count(img);
+		if (!args.has_array_offsets)
+		{
+			add_spv_func_and_recompile(is_compare ? SPVFuncImplGatherRectCompare : SPVFuncImplGatherRect);
+			return is_compare ? "spvGatherRectCompare" : "spvGatherRect";
+		}
+		else if (is_compare)
+		{
+			add_spv_func_and_recompile(SPVFuncImplGatherRectCompareConstOffsets);
+			return "spvGatherRectCompareConstOffsets";
+		}
+	}
+
 	// Special-case gather. We have to alter the component being looked up in the swizzle case.
 	if (msl_options.swizzle_texture_samples && args.base.is_gather && !is_dynamic_img_sampler &&
 	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
@@ -15117,18 +15191,30 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 
 	string farg_str;
 	bool forward = true;
+	const bool uses_rect_gather_helper =
+	    args.base.is_gather && imgtype.image.dim == DimRect && (!args.has_array_offsets || args.dref);
 
 	if (!is_dynamic_img_sampler)
 	{
+		if (uses_rect_gather_helper)
+		{
+			auto *combined = maybe_get<SPIRCombinedImageSampler>(img);
+			farg_str += to_expression(combined ? combined->image : img);
+			if (args.has_array_offsets)
+			{
+				forward = forward && should_forward(args.offset);
+				farg_str += ", " + to_unpacked_expression(args.offset);
+			}
+		}
 		// Texture reference (for some cases)
-		if (needs_chroma_reconstruction(constexpr_sampler))
+		else if (needs_chroma_reconstruction(constexpr_sampler))
 		{
 			// Multiplanar images need two or three textures.
 			farg_str += to_expression(img);
 			for (uint32_t i = 1; i < constexpr_sampler->planes; i++)
 				farg_str += join(", ", to_expression(img), plane_name_suffix, i);
 		}
-		else if ((!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable) &&
+		else if (!uses_rect_gather_helper && (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable) &&
 		         msl_options.swizzle_texture_samples && args.base.is_gather)
 		{
 			auto *combined = maybe_get<SPIRCombinedImageSampler>(img);
@@ -15136,18 +15222,18 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		}
 
 		// Gathers with constant offsets call a special function, so include the texture.
-		if (args.has_array_offsets)
+		if (!uses_rect_gather_helper && args.has_array_offsets)
 			farg_str += to_expression(img);
 
 		// Sampler reference
-		if (!args.base.is_fetch)
+		if (!uses_rect_gather_helper && !args.base.is_fetch)
 		{
 			if (!farg_str.empty())
 				farg_str += ", ";
 			farg_str += to_sampler_expression(img);
 		}
 
-		if ((!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable) &&
+		if (!uses_rect_gather_helper && (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable) &&
 		    msl_options.swizzle_texture_samples && args.base.is_gather)
 		{
 			// Add the swizzle constant from the swizzle buffer.
@@ -15156,14 +15242,14 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		}
 
 		// Const offsets gather puts the const offsets before the other args.
-		if (args.has_array_offsets)
+		if (!uses_rect_gather_helper && args.has_array_offsets)
 		{
 			forward = forward && should_forward(args.offset);
 			farg_str += ", " + to_unpacked_expression(args.offset);
 		}
 
 		// Const offsets gather or swizzled gather puts the component before the other args.
-		if (args.component && (args.has_array_offsets || msl_options.swizzle_texture_samples))
+		if (!uses_rect_gather_helper && args.component && (args.has_array_offsets || msl_options.swizzle_texture_samples))
 		{
 			forward = forward && should_forward(args.component);
 			farg_str += ", " + to_component_argument(args.component);
@@ -15633,6 +15719,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 			break;
 
 		case Dim2D:
+		case DimRect:
 			if (offset_type->vecsize > 2)
 				offset_expr = enclose_expression(offset_expr) + ".xy";
 
@@ -15654,10 +15741,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	if (args.component && !args.has_array_offsets)
 	{
 		// If 2D has gather component, ensure it also has an offset arg
-		if (imgtype.image.dim == Dim2D && offset_expr.empty())
+		if ((imgtype.image.dim == Dim2D || imgtype.image.dim == DimRect) && offset_expr.empty())
 			farg_str += ", int2(0)";
 
-		if (!msl_options.swizzle_texture_samples || is_dynamic_img_sampler)
+		if (uses_rect_gather_helper || !msl_options.swizzle_texture_samples || is_dynamic_img_sampler)
 		{
 			forward = forward && should_forward(args.component);
 
@@ -20744,6 +20831,7 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 		{
 		case Dim1D:
 		case Dim2D:
+		case DimRect:
 			if (img_type.dim == Dim1D && !msl_options.texture_1D_as_2D)
 			{
 				// Use a native Metal 1D texture
