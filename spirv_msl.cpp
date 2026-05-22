@@ -15576,6 +15576,11 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		{
 			farg_str += ", " + to_unpacked_expression(lod);
 		}
+		else if (msl_options.sample_dref_lod_cube_as_nearest_level && args.dref && imgtype.image.dim == DimCube &&
+		         !imgtype.image.arrayed)
+		{
+			farg_str += ", level(max(0.0, floor(" + to_unpacked_expression(lod) + " + 0.5)))";
+		}
 		else if (msl_options.sample_dref_lod_array_as_grad && args.dref && imgtype.image.arrayed)
 		{
 			if (msl_options.is_macos() && !msl_options.supports_msl_version(2, 3))

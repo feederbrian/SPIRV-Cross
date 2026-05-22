@@ -820,6 +820,12 @@ public:
 		// so it can be enabled only when the bug is present.
 		bool sample_dref_lod_array_as_grad = false;
 
+		// If set, Lod operands to OpImageSample*DrefExplicitLod for cube depth images
+		// will be rounded to the nearest mip before passing level(). This is narrower
+		// than the depth-array gradient workaround and only affects depth-cube compare
+		// LOD lowering.
+		bool sample_dref_lod_cube_as_nearest_level = false;
+
 		// MSL doesn't guarantee coherence between writes and subsequent reads of read_write textures.
 		// This inserts fences before each read of a read_write texture to ensure coherency.
 		// If you're sure you never rely on this, you can set this to false for a possible performance improvement.
