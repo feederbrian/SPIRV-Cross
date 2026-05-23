@@ -11940,7 +11940,10 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		}
 
 		string expr = type_to_glsl(rslt_type) + "(";
-		expr += img_exp + ".get_width(" + lod + ")";
+		if (img_dim == DimBuffer && !msl_options.texture_buffer_native)
+			expr += img_exp + ".get_width() * " + img_exp + ".get_height()";
+		else
+			expr += img_exp + ".get_width(" + lod + ")";
 
 		// CKPT119 (AppGL): include DimRect (image2DRect / sampler2DRect) so
 		// imageSize / textureSize emit BOTH width and height. Upstream
