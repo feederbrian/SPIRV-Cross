@@ -359,6 +359,8 @@ public:
 		uint32_t shader_input_buffer_index = 22;
 		uint32_t shader_index_buffer_index = 21;
 		uint32_t shader_patch_input_buffer_index = 20;
+        uint32_t draw_id_buffer_index = 19;
+		uint32_t reversed_depth_viewport_buffer_index = 18;
 		uint32_t shader_input_wg_index = 0;
 		uint32_t device_index = 0;
 		uint32_t enable_frag_output_mask = 0xffffffff;
@@ -380,6 +382,7 @@ public:
 		bool view_index_from_device_index = false;
 		bool dispatch_base = false;
 		bool texture_1D_as_2D = false;
+		bool emulate_reversed_depth_viewport = false;
 
 		// Enable use of Metal argument buffers.
 		// MSL 2.0 must also be enabled.
@@ -936,6 +939,14 @@ public:
 	bool needs_buffer_size_buffer() const
 	{
 		return !buffers_requiring_array_length.empty();
+	}
+
+	// Provide feedback to calling API to determine if the vertex shader writes
+	// to PointSize. This allows the API to avoid declaring a point size output
+	// when it is not needed.
+	bool get_writes_to_point_size() const
+	{
+		return writes_to_point_size;
 	}
 
 	bool buffer_requires_array_length(VariableID id) const
@@ -1594,6 +1605,7 @@ protected:
 	uint32_t swizzle_buffer_id = 0;
 	uint32_t buffer_size_buffer_id = 0;
 	uint32_t view_mask_buffer_id = 0;
+	uint32_t draw_index_buffer_id = 0;
 	uint32_t dynamic_offsets_buffer_id = 0;
 	uint32_t uint_type_id = 0;
 	uint32_t shared_uint_type_id = 0;
@@ -1722,6 +1734,7 @@ protected:
 	bool writes_to_depth = false;
 	bool writes_to_point_size = false;
 	std::string qual_pos_var_name;
+	std::string qual_viewport_idx_var_name;
 	std::string stage_in_var_name = "in";
 	std::string stage_out_var_name = "out";
 	std::string patch_stage_in_var_name = "patchIn";
