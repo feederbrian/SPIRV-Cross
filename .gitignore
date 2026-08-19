@@ -29,3 +29,11 @@
 
 # Running tests leaves *.spv files in the root directory.
 *.spv
+
+# AppGL fork: tools/ holds hand-written investigation harnesses. Their
+# compiled binaries are build output and must not enter history.
+/tools/msl-cross-stage-order-test
+/tools/msl-cross-stage-probe
+/tools/msl-cross-stage-probe-tcs-to-tes
+/tools/msl-gs-as-mesh-test
+/tools/msl-split-tcs-test
