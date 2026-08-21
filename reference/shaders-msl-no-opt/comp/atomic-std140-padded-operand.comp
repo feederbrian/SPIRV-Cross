@@ -1,0 +1,30 @@
+#pragma clang diagnostic ignored "-Wunused-variable"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+struct SSBO
+{
+    uint counter;
+};
+
+struct UBO
+{
+    uint4 values[4];
+};
+
+constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(1u);
+
+kernel void main0(device SSBO& ssbo [[buffer(0)]], constant UBO& ubo [[buffer(1)]])
+{
+    uint _25 = atomic_fetch_add_explicit((device atomic_uint*)&ssbo.counter, ubo.values[1].x, memory_order_relaxed);
+    uint _33;
+    do
+    {
+        _33 = ubo.values[2].x;
+    } while (!atomic_compare_exchange_weak_explicit((device atomic_uint*)&ssbo.counter, &_33, ubo.values[3].x, memory_order_relaxed, memory_order_relaxed) && _33 == ubo.values[2].x);
+}
+

@@ -1,0 +1,24 @@
+#pragma clang diagnostic ignored "-Wunused-variable"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+struct SSBO
+{
+    uint counter;
+};
+
+struct UBO
+{
+    uint4 values[4];
+};
+
+kernel void main0(device SSBO& ssbo [[buffer(0)]], constant UBO& ubo [[buffer(1)]])
+{
+    uint _25 = uint(atomic_fetch_min_explicit((device atomic_int*)&ssbo.counter, int(ubo.values[1].x), memory_order_relaxed));
+    uint _35 = uint(atomic_fetch_max_explicit((device atomic_int*)&ssbo.counter, int(ubo.values[2].x), memory_order_relaxed));
+}
+

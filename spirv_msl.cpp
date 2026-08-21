@@ -14244,16 +14244,13 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, 
 		else
 			scalar_expression = to_expression(result_id);
 
-		// [appgl-local] op1 may be a scalar stored in a padded physical
-		// type (e.g. `uint` laid out as `uint4` under std140 default-
-		// uniform rules). to_unpacked_expression applies the .x / cast
-		// required to read the scalar out of the packed slot, where
-		// to_expression would yield the full uint4 and trip MSL's
-		// strict `uint = uint4` assignment check. Same for the
-		// while-loop compare below.
-		const std::string op1_unpacked_expr = to_unpacked_expression(op1);
-		statement(scalar_expression, " = ", op1_unpacked_expr, ";");
-		end_scope_decl(join("while (!", exp, " && ", scalar_expression, " == ", enclose_expression(op1_unpacked_expr), ")"));
+		// [appgl-local] op1 may be a scalar stored in a padded physical type (e.g. a
+		// `uint` laid out as `uint4` under std140 default-uniform rules), so read it
+		// through the unpacked accessors, which apply the `.x` swizzle in that case
+		// and are a no-op otherwise. to_enclosed_unpacked_expression is the existing
+		// enclosing counterpart, so this keeps upstream's exact call shape.
+		statement(scalar_expression, " = ", to_unpacked_expression(op1), ";");
+		end_scope_decl(join("while (!", exp, " && ", scalar_expression, " == ", to_enclosed_unpacked_expression(op1), ")"));
 		if (vec4_temporary_id)
 			statement(to_expression(result_id), " = ", scalar_expression, ";");
 
@@ -14277,16 +14274,26 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, 
 			if (op1_is_literal)
 				exp += to_string(op1);
 			else
-				// [appgl-local] to_unpacked_expression so a scalar
-				// stored in a std140-padded physical type (e.g.
-				// `uint` laid out as `uint4` under default-uniform
-				// rules) gets the `.x` swizzle before being passed
-				// as the `operand` argument of an MSL atomic. The
-				// upstream bitcast_expression wraps to_expression,
-				// which produces the full uint4 in that scenario,
-				// and MSL's atomic_exchange / fetch_add / ... only
-				// accept scalar operands.
-				exp += to_unpacked_expression(op1);
+			{
+				// [appgl-local] Two requirements compose here, and replacing one with the
+				// other loses emission that upstream relies on:
+				//  - Upstream 5a5be7f9 bitcasts the operand to the signedness implied by
+				//    the opcode, because C++ deduces the atomic's type from the pointer
+				//    and signed min/max on a uint slot (or vice versa) needs the explicit
+				//    int()/uint() cast.
+				//  - A scalar stored in a std140-padded physical type (a `uint` laid out
+				//    as `uint4` under default-uniform rules) needs the `.x` swizzle before
+				//    it can be passed as a scalar atomic operand.
+				// So bitcast the *unpacked* expression rather than picking one or the
+				// other. The three-argument bitcast_expression applies exactly the same
+				// cast and the same "skip if the basetypes already agree" guard as the
+				// two-argument form upstream used; it just takes the operand text we
+				// already unpacked instead of calling to_expression itself.
+				auto op1_basetype = expression_type(op1).basetype;
+				auto bitcast_type = expression_type(op1);
+				bitcast_type.basetype = expected_type;
+				exp += bitcast_expression(bitcast_type, op1_basetype, to_unpacked_expression(op1));
+			}
 		}
 
 		if (op2)

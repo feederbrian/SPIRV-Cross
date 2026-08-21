@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 1) in;
+
+// std140 forces ArrayStride 16 on a scalar array, so MSL lays `values` out as
+// uint4[4] and every element read needs a .x to become a scalar again.
+layout(std140, set = 0, binding = 0) uniform UBO
+{
+	uint values[4];
+} ubo;
+
+layout(std430, set = 0, binding = 1) buffer SSBO
+{
+	uint counter;
+} ssbo;
+
+void main()
+{
+	// Plain operand path.
+	atomicAdd(ssbo.counter, ubo.values[1]);
+	// compare_exchange: expected and desired both come out of padded slots.
+	atomicCompSwap(ssbo.counter, ubo.values[2], ubo.values[3]);
+}

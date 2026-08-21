@@ -1,0 +1,60 @@
+; Signed min/max on an unsigned slot (OpAtomicSMin through a uint pointer) where
+; the operand ALSO lives in a std140-padded slot: ArrayStride 16 on a scalar array
+; makes MSL lay `values` out as uint4[4].
+;
+; Both fixups therefore have to apply to the same operand:
+;   - the .x that pulls the scalar out of the padded uint4, and
+;   - the int() cast that tells C++ which atomic overload to pick.
+; Emitting only one of them regresses; this shader pins both.
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+               OpSource GLSL 450
+               OpName %main "main"
+               OpName %SSBO "SSBO"
+               OpMemberName %SSBO 0 "counter"
+               OpName %ssbo "ssbo"
+               OpName %UBO "UBO"
+               OpMemberName %UBO 0 "values"
+               OpName %ubo "ubo"
+               OpDecorate %SSBO Block
+               OpMemberDecorate %SSBO 0 Offset 0
+               OpDecorate %ssbo Binding 1
+               OpDecorate %ssbo DescriptorSet 0
+               OpDecorate %_arr_uint_uint_4 ArrayStride 16
+               OpDecorate %UBO Block
+               OpMemberDecorate %UBO 0 Offset 0
+               OpDecorate %ubo Binding 0
+               OpDecorate %ubo DescriptorSet 0
+       %void = OpTypeVoid
+          %3 = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+       %SSBO = OpTypeStruct %uint
+%_ptr_StorageBuffer_SSBO = OpTypePointer StorageBuffer %SSBO
+       %ssbo = OpVariable %_ptr_StorageBuffer_SSBO StorageBuffer
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+     %uint_4 = OpConstant %uint 4
+%_arr_uint_uint_4 = OpTypeArray %uint %uint_4
+        %UBO = OpTypeStruct %_arr_uint_uint_4
+%_ptr_Uniform_UBO = OpTypePointer Uniform %UBO
+        %ubo = OpVariable %_ptr_Uniform_UBO Uniform
+      %int_1 = OpConstant %int 1
+      %int_2 = OpConstant %int 2
+%_ptr_Uniform_uint = OpTypePointer Uniform %uint
+     %uint_1 = OpConstant %uint 1
+     %uint_0 = OpConstant %uint 0
+       %main = OpFunction %void None %3
+          %5 = OpLabel
+         %13 = OpAccessChain %_ptr_StorageBuffer_uint %ssbo %int_0
+         %21 = OpAccessChain %_ptr_Uniform_uint %ubo %int_0 %int_1
+         %22 = OpLoad %uint %21
+         %25 = OpAtomicSMin %uint %13 %uint_1 %uint_0 %22
+         %31 = OpAccessChain %_ptr_Uniform_uint %ubo %int_0 %int_2
+         %32 = OpLoad %uint %31
+         %35 = OpAtomicSMax %uint %13 %uint_1 %uint_0 %32
+               OpReturn
+               OpFunctionEnd
