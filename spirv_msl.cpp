@@ -11798,12 +11798,29 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			uint32_t id = ops[1];
 
 			std::string coord = to_expression(ops[3]);
-			auto &type = expression_type(ops[2]);
-			if ((type.image.dim == Dim2D || type.image.dim == DimRect) && !type.image.arrayed)
+
+			// [appgl-local] The sidecar buffer that emulates the image is linear, so what
+			// selects the lowering is how many components the texel coordinate actually
+			// has -- not Dim on its own. Selecting on Dim mishandles an arrayed image
+			// whose Dim implies fewer components than its coordinate carries: an arrayed
+			// 1D image has Dim1D but a two-component (x, layer) coordinate, so it matched
+			// neither Dim test and fell through with no lowering at all, emitting
+			// `..._atomic[int2(...)]`, which Metal rejects outright with
+			// "array subscript is not an integer".
+			//
+			// Reading the operand keeps every other case bit-identical: measured against
+			// this fork, the texel coordinate is vecsize 3 for 3D, Cube, arrayed Cube and
+			// arrayed 2D (all of which selected spvImage3DAtomicCoord before) and vecsize 2
+			// for 2D and Rect (which selected spvImage2DAtomicCoord before). A
+			// four-component texel coordinate does not occur -- an arrayed cube image
+			// carries its layer-face in .z -- so nothing reaches the trailing fall-through
+			// except the genuinely scalar non-arrayed 1D case, which needs no lowering.
+			uint32_t coord_components = expression_type(ops[3]).vecsize;
+			if (coord_components == 2)
 			{
 				coord = join("spvImage2DAtomicCoord(", coord, ", ", to_expression(ops[2]), ")");
 			}
-			else if (type.image.dim == Dim2D || type.image.dim == Dim3D || type.image.dim == DimCube)
+			else if (coord_components == 3)
 			{
 				coord = join("spvImage3DAtomicCoord(", coord, ", ", to_expression(ops[2]), ")");
 			}

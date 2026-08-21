@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 1) in;
+
+// An arrayed 1D image: Dim is Dim1D, but the texel coordinate is a two-component
+// (x, layer) vector. Selecting the emulated-atomic lowering on Dim leaves this case
+// with no lowering at all and emits `uImage1DArray_atomic[int2(...)]`, which Metal
+// rejects with "array subscript is not an integer".
+layout(r32ui, binding = 0) uniform uimage1DArray uImage1DArray;
+
+// Controls that pin the other two selector outcomes in the same reference:
+// a non-arrayed 1D image (scalar coordinate, no lowering) and an arrayed 2D image
+// (three-component coordinate, spvImage3DAtomicCoord).
+layout(r32ui, binding = 1) uniform uimage1D uImage1D;
+layout(r32ui, binding = 2) uniform uimage2DArray uImage2DArray;
+
+layout(binding = 3, std430) buffer SSBO
+{
+    uint v0;
+    uint v1;
+    uint v2;
+    uint v3;
+} ssbo;
+
+void main()
+{
+    ssbo.v0 = imageAtomicAdd(uImage1DArray, ivec2(3, 1), 4u);
+    ssbo.v1 = imageAtomicMax(uImage1DArray, ivec2(7, 2), 5u);
+    ssbo.v2 = imageAtomicAdd(uImage1D, 3, 4u);
+    ssbo.v3 = imageAtomicAdd(uImage2DArray, ivec3(3, 1, 2), 4u);
+}

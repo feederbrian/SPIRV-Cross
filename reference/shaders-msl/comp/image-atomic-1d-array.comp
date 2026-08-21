@@ -1,0 +1,39 @@
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+// The required alignment of a linear texture of R32Uint format.
+constant uint spvLinearTextureAlignmentOverride [[function_constant(65535)]];
+constant uint spvLinearTextureAlignment = is_function_constant_defined(spvLinearTextureAlignmentOverride) ? spvLinearTextureAlignmentOverride : 4;
+#define spvImageAtomicAlignedWidth(tex) (((tex).get_width() +  spvLinearTextureAlignment / 4 - 1) & ~( spvLinearTextureAlignment / 4 - 1))
+// Returns buffer coords corresponding to texture coords for emulating image atomics
+#define spvImage2DAtomicCoord(tc, tex) ((spvImageAtomicAlignedWidth(tex) * (tc).y) + (tc).x)
+#define spvImage3DAtomicCoord(tc, tex) (((spvImageAtomicAlignedWidth(tex) * (tex).get_height()) * (tc).z) + (spvImageAtomicAlignedWidth(tex) * (tc).y) + (tc).x)
+
+struct SSBO
+{
+    uint v0;
+    uint v1;
+    uint v2;
+    uint v3;
+};
+
+constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(1u);
+
+kernel void main0(device SSBO& ssbo [[buffer(0)]], texture1d_array<uint> uImage1DArray [[texture(0)]], device atomic_uint* uImage1DArray_atomic [[buffer(1)]], texture1d<uint> uImage1D [[texture(1)]], device atomic_uint* uImage1D_atomic [[buffer(2)]], texture2d_array<uint> uImage2DArray [[texture(2)]], device atomic_uint* uImage2DArray_atomic [[buffer(3)]])
+{
+    uint _24 = atomic_fetch_add_explicit((device atomic_uint*)&uImage1DArray_atomic[spvImage2DAtomicCoord(int2(3, 1), uImage1DArray)], 4u, memory_order_relaxed);
+    ssbo.v0 = _24;
+    uint _32 = atomic_fetch_max_explicit((device atomic_uint*)&uImage1DArray_atomic[spvImage2DAtomicCoord(int2(7, 2), uImage1DArray)], 5u, memory_order_relaxed);
+    ssbo.v1 = _32;
+    uint _38 = atomic_fetch_add_explicit((device atomic_uint*)&uImage1D_atomic[3], 4u, memory_order_relaxed);
+    ssbo.v2 = _38;
+    uint _46 = atomic_fetch_add_explicit((device atomic_uint*)&uImage2DArray_atomic[spvImage3DAtomicCoord(int3(3, 1, 2), uImage2DArray)], 4u, memory_order_relaxed);
+    ssbo.v3 = _46;
+}
+
