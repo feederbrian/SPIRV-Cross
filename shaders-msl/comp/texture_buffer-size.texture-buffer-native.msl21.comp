@@ -1,0 +1,15 @@
+#version 310 es
+#extension GL_OES_texture_buffer : require
+layout(local_size_x = 1) in;
+
+layout(binding = 4) uniform highp samplerBuffer uSamp;
+layout(rgba32f, binding = 5) uniform readonly highp imageBuffer uSampo;
+layout(binding = 6, std430) buffer SSBO
+{
+	ivec2 sizes;
+} ssbo;
+
+void main()
+{
+	ssbo.sizes = ivec2(textureSize(uSamp), imageSize(uSampo));
+}

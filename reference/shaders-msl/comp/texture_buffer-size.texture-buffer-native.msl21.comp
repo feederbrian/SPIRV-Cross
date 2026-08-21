@@ -1,0 +1,17 @@
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct SSBO
+{
+    int2 sizes;
+};
+
+constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(1u);
+
+kernel void main0(device SSBO& ssbo [[buffer(0)]], texture_buffer<float> uSamp [[texture(0)]], texture_buffer<float, access::read_write> uSampo [[texture(1)]])
+{
+    ssbo.sizes = int2(int(uSamp.get_width()), int(uSampo.get_width()));
+}
+
