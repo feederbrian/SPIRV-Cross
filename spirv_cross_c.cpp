@@ -768,6 +768,10 @@ spvc_result spvc_compiler_options_set_uint(spvc_compiler_options options, spvc_c
 		options->msl.sample_dref_lod_array_as_grad = value != 0;
 		break;
 
+	case SPVC_COMPILER_OPTION_MSL_SAMPLE_DREF_LOD_CUBE_AS_NEAREST_LEVEL:
+		options->msl.sample_dref_lod_cube_as_nearest_level = value != 0;
+		break;
+
 	case SPVC_COMPILER_OPTION_MSL_READWRITE_TEXTURE_FENCES:
 		options->msl.readwrite_texture_fences = value != 0;
 		break;

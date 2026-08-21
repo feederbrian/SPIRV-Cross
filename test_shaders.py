@@ -383,6 +383,8 @@ def cross_compile_msl(shader, spirv, opt, iterations, paths):
         msl_args.append('--msl-emulate-reversed-depth-viewport')
     if '.lod-as-grad.' in shader:
         msl_args.append('--msl-sample-dref-lod-array-as-grad')
+    if '.cube-lod-as-nearest-level.' in shader:
+        msl_args.append('--msl-sample-dref-lod-cube-as-nearest-level')
     if '.agx-cube-grad.' in shader:
         msl_args.append('--msl-agx-manual-cube-grad-fixup')
     if '.decoration-binding.' in shader:

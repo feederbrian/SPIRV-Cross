@@ -691,6 +691,7 @@ struct CLIArguments
 	bool msl_force_fragment_with_side_effects_execution = false;
 	bool msl_emulate_reversed_depth_viewport = false;
 	bool msl_sample_dref_lod_array_as_grad = false;
+	bool msl_sample_dref_lod_cube_as_nearest_level = false;
 	bool msl_runtime_array_rich_descriptor = false;
 	bool msl_replace_recursive_inputs = false;
 	bool msl_readwrite_texture_fences = true;
@@ -1023,6 +1024,10 @@ static void print_help_msl()
 	                "\t\tSome Metal devices have a bug where the level() argument to\n"
 	                "\t\tdepth2d_array<T>::sample_compare() in a fragment shader is biased by some\n"
 	                "\t\tunknown amount. This prevents the bias from being added.\n"
+	                "\t[--msl-sample-dref-lod-cube-as-nearest-level]:\n\t\tRound the level() argument for\n"
+	                "\t\tnon-arrayed depthcube<T>::sample_compare() to the nearest mip level, clamped to 0.\n"
+	                "\t\tNarrower than --msl-sample-dref-lod-array-as-grad: it only affects depth-cube\n"
+	                "\t\tcompare sampling with an explicit LOD, and leaves every other case unchanged.\n"
 	                "\t[--msl-no-readwrite-texture-fences]:\n\t\tDo not insert fences before each read of a\n"
 	                "\t\tread_write texture. MSL does not guarantee coherence between writes and later reads\n"
 	                "\t\tof read_write textures. If you don't rely on this, you can disable this for a\n"
@@ -1358,6 +1363,7 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.force_fragment_with_side_effects_execution = args.msl_force_fragment_with_side_effects_execution;
 		msl_opts.emulate_reversed_depth_viewport = args.msl_emulate_reversed_depth_viewport;
 		msl_opts.sample_dref_lod_array_as_grad = args.msl_sample_dref_lod_array_as_grad;
+		msl_opts.sample_dref_lod_cube_as_nearest_level = args.msl_sample_dref_lod_cube_as_nearest_level;
 		msl_opts.ios_support_base_vertex_instance = true;
 		msl_opts.runtime_array_rich_descriptor = args.msl_runtime_array_rich_descriptor;
 		msl_opts.replace_recursive_inputs = args.msl_replace_recursive_inputs;
@@ -1986,6 +1992,8 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--msl-emulate-reversed-depth-viewport", [&args](CLIParser &) { args.msl_emulate_reversed_depth_viewport = true; });
 	cbs.add("--msl-sample-dref-lod-array-as-grad",
 	        [&args](CLIParser &) { args.msl_sample_dref_lod_array_as_grad = true; });
+	cbs.add("--msl-sample-dref-lod-cube-as-nearest-level",
+	        [&args](CLIParser &) { args.msl_sample_dref_lod_cube_as_nearest_level = true; });
 	cbs.add("--msl-no-readwrite-texture-fences", [&args](CLIParser &) { args.msl_readwrite_texture_fences = false; });
 	cbs.add("--msl-agx-manual-cube-grad-fixup", [&args](CLIParser &) { args.msl_agx_manual_cube_grad_fixup = true; });
 	cbs.add("--msl-combined-sampler-suffix", [&args](CLIParser &parser) {
