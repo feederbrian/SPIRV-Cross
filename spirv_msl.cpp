@@ -7438,6 +7438,22 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"inline appgl_df64mat4x3 appgl_df64_mul(appgl_df64mat4x3 a, appgl_df64mat4x4 b) { return appgl_df64mat4x3(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2), appgl_df64_mul(a, b.c3)); }",
 		"inline appgl_df64mat2x4 appgl_df64_mul(appgl_df64mat4x4 a, appgl_df64mat2x4 b) { return appgl_df64mat2x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1)); }",
 		"inline appgl_df64mat3x4 appgl_df64_mul(appgl_df64mat4x4 a, appgl_df64mat3x4 b) { return appgl_df64mat3x4(appgl_df64_mul(a, b.c0), appgl_df64_mul(a, b.c1), appgl_df64_mul(a, b.c2)); }",
+		// GLSL fract(). This is the one builtin the helper block never carried: the
+		// AppGL runtime spliced it in afterwards by locating the old one-line
+		// appgl_df64_trunc definition as a text anchor
+		// (ShaderTranslator.cpp:1169 injectFp64FractOverloads). Rewriting trunc into
+		// a multi-line body silently dissolved that anchor, so fract(double)
+		// disappeared and any shader calling it failed to compile at all
+		// (KHR-GL46.compute_shader.fp64-case3). Owning fract here removes the splice:
+		// the runtime injector already no-ops when appgl_df64_fract is present.
+		"inline appgl_df64 appgl_df64_fract(appgl_df64 value) { return appgl_df64_sub(value, appgl_df64_floor(value)); }",
+		"inline appgl_df64x2 appgl_df64_fract(appgl_df64x2 value) { return appgl_df64x2(appgl_df64_fract(value.x), appgl_df64_fract(value.y)); }",
+		"inline appgl_df64x3 appgl_df64_fract(appgl_df64x3 value) { return appgl_df64x3(appgl_df64_fract(value.x), appgl_df64_fract(value.y), appgl_df64_fract(value.z)); }",
+		"inline appgl_df64x4 appgl_df64_fract(appgl_df64x4 value) { return appgl_df64x4(appgl_df64_fract(value.x), appgl_df64_fract(value.y), appgl_df64_fract(value.z), appgl_df64_fract(value.w)); }",
+		"inline appgl_df64 fract(appgl_df64 value) { return appgl_df64_fract(value); }",
+		"inline appgl_df64x2 fract(appgl_df64x2 value) { return appgl_df64_fract(value); }",
+		"inline appgl_df64x3 fract(appgl_df64x3 value) { return appgl_df64_fract(value); }",
+		"inline appgl_df64x4 fract(appgl_df64x4 value) { return appgl_df64_fract(value); }",
 		"inline appgl_df64 operator+(appgl_df64 a, appgl_df64 b) { return appgl_df64_add(a, b); }",
 		"inline appgl_df64 operator-(appgl_df64 a, appgl_df64 b) { return appgl_df64_sub(a, b); }",
 		"inline appgl_df64 operator-(appgl_df64 a) { return appgl_df64_neg(a); }",
