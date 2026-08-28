@@ -6787,6 +6787,11 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"    alignas(8) uint2 words;",
 		"    appgl_df64() = default;",
 		"    explicit appgl_df64(uint2 w) : words(w) {}",
+		"    // GLSL bool -> double is exactly 1.0 or 0.0. SPIRV-Cross emits that",
+		"    // conversion as a constructor cast, and without this overload it binds",
+		"    // to the uint2 word constructor instead: `true` becomes words (1,1),",
+		"    // which reinterprets as two float32 denormals (~1.4e-45), not 1.0.",
+		"    appgl_df64(bool v) : words(as_type<uint2>(float2(v ? 1.0f : 0.0f, 0.0f))) {}",
 		"};",
 		"",
 		"struct appgl_df64x2 {",
@@ -6794,6 +6799,9 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"    appgl_df64 y;",
 		"    appgl_df64x2() = default;",
 		"    appgl_df64x2(appgl_df64 a, appgl_df64 b) : x(a), y(b) {}",
+		"    // bvec2 -> dvec2: without this the generated library fails to"
+		"    // compile outright and every draw using the shader is dropped.",
+		"    appgl_df64x2(bool2 v) : x(appgl_df64(v.x)), y(appgl_df64(v.y)) {}",
 		"    // Scalar broadcast. GLSL widens a scalar operand across a vector",
 		"    // (`1.0lf / dvec2`), and the MSL backend emits that as a one-argument",
 		"    // construction. Without this the generated library fails to compile and",
@@ -6808,6 +6816,9 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"    appgl_df64 _pad;",
 		"    appgl_df64x3() = default;",
 		"    appgl_df64x3(appgl_df64 a, appgl_df64 b, appgl_df64 c) : x(a), y(b), z(c) {}",
+		"    // bvec3 -> dvec3: without this the generated library fails to"
+		"    // compile outright and every draw using the shader is dropped.",
+		"    appgl_df64x3(bool3 v) : x(appgl_df64(v.x)), y(appgl_df64(v.y)), z(appgl_df64(v.z)) {}",
 		"    explicit appgl_df64x3(appgl_df64 v) : x(v), y(v), z(v) {}",
 		"};",
 		"",
@@ -6818,6 +6829,9 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"    appgl_df64 w;",
 		"    appgl_df64x4() = default;",
 		"    appgl_df64x4(appgl_df64 a, appgl_df64 b, appgl_df64 c, appgl_df64 d) : x(a), y(b), z(c), w(d) {}",
+		"    // bvec4 -> dvec4: without this the generated library fails to"
+		"    // compile outright and every draw using the shader is dropped.",
+		"    appgl_df64x4(bool4 v) : x(appgl_df64(v.x)), y(appgl_df64(v.y)), z(appgl_df64(v.z)), w(appgl_df64(v.w)) {}",
 		"    explicit appgl_df64x4(appgl_df64 v) : x(v), y(v), z(v), w(v) {}",
 		"};",
 		"",
@@ -6943,6 +6957,56 @@ void CompilerMSL::emit_appgl_fp64_emulation_helpers()
 		"inline float2 appgl_df64_to_dd(appgl_df64 value)",
 		"{",
 		"    return as_type<float2>(value.words);",
+		"}",
+		"",
+		"// int -> df64, exactly. Routing through a single float32 first caps the",
+		"// value at 24 mantissa bits, so anything >= 2^24 arrives already rounded.",
+		"// Splitting on a 16-bit boundary keeps both halves exactly representable;",
+		"// a quick-two-sum then renormalises the limb pair.",
+		"inline appgl_df64 appgl_df64_from_int(int value)",
+		"{",
+		"    float hi = float(value >> 16) * 65536.0f;",
+		"    float lo = float(value & 0xffff);",
+		"    float s = hi + lo;",
+		"    return appgl_df64_from_dd(float2(s, lo - (s - hi)));",
+		"}",
+		"",
+		"inline appgl_df64 appgl_df64_from_uint(uint value)",
+		"{",
+		"    float hi = float(value >> 16u) * 65536.0f;",
+		"    float lo = float(value & 0xffffu);",
+		"    float s = hi + lo;",
+		"    return appgl_df64_from_dd(float2(s, lo - (s - hi)));",
+		"}",
+		"",
+		"inline appgl_df64x2 appgl_df64_from_int(int2 value)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_from_int(value.x), appgl_df64_from_int(value.y));",
+		"}",
+		"",
+		"inline appgl_df64x3 appgl_df64_from_int(int3 value)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_from_int(value.x), appgl_df64_from_int(value.y), appgl_df64_from_int(value.z));",
+		"}",
+		"",
+		"inline appgl_df64x4 appgl_df64_from_int(int4 value)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_from_int(value.x), appgl_df64_from_int(value.y), appgl_df64_from_int(value.z), appgl_df64_from_int(value.w));",
+		"}",
+		"",
+		"inline appgl_df64x2 appgl_df64_from_uint(uint2 value)",
+		"{",
+		"    return appgl_df64x2(appgl_df64_from_uint(value.x), appgl_df64_from_uint(value.y));",
+		"}",
+		"",
+		"inline appgl_df64x3 appgl_df64_from_uint(uint3 value)",
+		"{",
+		"    return appgl_df64x3(appgl_df64_from_uint(value.x), appgl_df64_from_uint(value.y), appgl_df64_from_uint(value.z));",
+		"}",
+		"",
+		"inline appgl_df64x4 appgl_df64_from_uint(uint4 value)",
+		"{",
+		"    return appgl_df64x4(appgl_df64_from_uint(value.x), appgl_df64_from_uint(value.y), appgl_df64_from_uint(value.z), appgl_df64_from_uint(value.w));",
 		"}",
 		"",
 		"inline appgl_df64 appgl_df64_from_float(float value)",
@@ -11527,11 +11591,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 		if (appgl_fp64_emulation_enabled_for_type(dst_type))
 		{
-			SPIRType float_type = dst_type;
-			float_type.basetype = SPIRType::Float;
-			float_type.width = 32;
-			auto expr = join("appgl_df64_from_float(", type_to_glsl_constructor(float_type), "(",
-			                 to_unpacked_expression(arg), "))");
+			// Convert from the integer directly. Going via float32 first would
+			// round every value with more than 24 significant bits before the
+			// df64 ever sees it.
+			const char *fn = opcode == OpConvertSToF ? "appgl_df64_from_int("
+			                                         : "appgl_df64_from_uint(";
+			auto expr = join(fn, to_unpacked_expression(arg), ")");
 			emit_op(result_type, id, expr, should_forward(arg));
 			inherit_expression_dependencies(id, arg);
 		}
